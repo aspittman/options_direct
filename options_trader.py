@@ -22,6 +22,7 @@ from alpaca.trading.enums import (
     AssetStatus
 )
 from alpaca.common.exceptions import APIError
+from requests.exceptions import RequestException
 
 from config import (
     API_KEY,
@@ -257,14 +258,25 @@ def get_option_contract(underlying, option_type="call", min_dte=30, max_dte=60):
 
     contracts = []
 
-    while True:
-        response = trading_client.get_option_contracts(request)
-        contracts.extend(response.option_contracts or [])
+    try:
+        while True:
+            response = trading_client.get_option_contracts(request)
+            contracts.extend(response.option_contracts or [])
 
-        if not response.next_page_token:
-            break
+            if not response.next_page_token:
+                break
 
-        request.page_token = response.next_page_token
+            request.page_token = response.next_page_token
+
+    except (APIError, RequestException) as e:
+        bot_log(f"Could not get option contracts for {underlying}: {e}")
+        record_event(
+            "SKIP",
+            underlying=underlying,
+            reason="contract_lookup_failed",
+            details=str(e)
+        )
+        return None
 
     if not contracts:
         bot_log(f"No option contracts found for {underlying}")
@@ -381,7 +393,7 @@ def buy_option_contract(option_symbol, qty=1, underlying=""):
             details=f"order_id={getattr(submitted_order, 'id', '')}"
         )
 
-    except APIError as e:
+    except (APIError, RequestException) as e:
         bot_log(f"Option order failed: {e}")
         record_event(
             "ORDER_FAILED",
@@ -433,7 +445,7 @@ def close_option_position(position, underlying, reason):
             details=f"order_id={getattr(submitted_order, 'id', '')}"
         )
 
-    except APIError as e:
+    except (APIError, RequestException) as e:
         bot_log(f"Exit failed for {position.symbol}: {e}")
         record_event(
             "ORDER_FAILED",

@@ -1,5 +1,6 @@
 import yfinance as yf
 import ta
+from requests.exceptions import RequestException
 
 from bot_logger import bot_log
 
@@ -8,7 +9,12 @@ def wait_for_market_open(trading_client):
     import time
 
     while True:
-        clock = trading_client.get_clock()
+        try:
+            clock = trading_client.get_clock()
+        except RequestException as e:
+            bot_log(f"Could not get market clock from Alpaca: {e}. Retrying in 60 seconds.")
+            time.sleep(60)
+            continue
 
         if clock.is_open:
             bot_log("Market is open.")
