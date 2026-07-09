@@ -34,11 +34,13 @@ from config import (
     MIN_OPEN_INTEREST,
     MIN_OPTION_VOLUME,
     OPTION_DATA_FEED,
-    TARGET_DELTA
+    TARGET_DELTA,
+    require_alpaca_credentials
 )
 from analytics import get_latest_entry_price, record_event
 from bot_logger import bot_log
 
+API_KEY, SECRET_KEY = require_alpaca_credentials()
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=ALPACA_PAPER)
 option_data_client = OptionHistoricalDataClient(API_KEY, SECRET_KEY)
 stock_data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)

@@ -3,11 +3,86 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-API_KEY = os.getenv("API_KEY")
-SECRET_KEY = os.getenv("SECRET_KEY")
+ALPACA_API_KEY_ENV_NAMES = ("APCA_API_KEY_ID", "ALPACA_API_KEY", "API_KEY")
+ALPACA_SECRET_KEY_ENV_NAMES = ("APCA_API_SECRET_KEY", "ALPACA_SECRET_KEY", "SECRET_KEY")
+
+
+def _first_env_value(names):
+    for name in names:
+        value = os.getenv(name)
+        if value and value.strip():
+            return value.strip()
+
+    return None
+
+
+API_KEY = _first_env_value(ALPACA_API_KEY_ENV_NAMES)
+SECRET_KEY = _first_env_value(ALPACA_SECRET_KEY_ENV_NAMES)
 ALPACA_PAPER = os.getenv("ALPACA_PAPER", "true").lower() == "true"
 
-UNDERLYINGS = ["SPY", "QQQ", "AAPL", "MSFT", "NVDA"]
+
+def require_alpaca_credentials():
+    missing = []
+
+    if not API_KEY:
+        missing.append("API key")
+
+    if not SECRET_KEY:
+        missing.append("secret key")
+
+    if missing:
+        raise RuntimeError(
+            "Missing Alpaca credentials: "
+            + ", ".join(missing)
+            + ". Set them in .env or your shell using "
+            + f"one API key variable from {ALPACA_API_KEY_ENV_NAMES} and "
+            + f"one secret key variable from {ALPACA_SECRET_KEY_ENV_NAMES}."
+        )
+
+    return API_KEY, SECRET_KEY
+
+UNDERLYINGS = [
+    "SPY",
+    "QQQ",
+    "IWM",
+    "DIA",
+    "AAPL",
+    "MSFT",
+    "NVDA",
+    "AMZN",
+    "META",
+    "GOOGL",
+    "GOOG",
+    "TSLA",
+    "AMD",
+    "NFLX",
+    "AVGO",
+    "CRM",
+    "ORCL",
+    "ADBE",
+    "INTC",
+    "QCOM",
+    "MU",
+    "JPM",
+    "BAC",
+    "GS",
+    "MS",
+    "C",
+    "XOM",
+    "CVX",
+    "COP",
+    "SLB",
+    "UNH",
+    "LLY",
+    "JNJ",
+    "PFE",
+    "MRK",
+    "COST",
+    "WMT",
+    "HD",
+    "DIS",
+    "BA",
+]
 
 DOLLARS_PER_TRADE = 100
 MAX_POSITIONS = 2
@@ -37,8 +112,8 @@ MARKET_REGIME_LONG_MA = 200
 UNDERLYING_STOP_LOSS_PCT = 0.03
 UNDERLYING_TAKE_PROFIT_PCT = 0.08
 
-OPTION_PREMIUM_ESTIMATE_PERCENT = 0.03
-OPTION_LEVERAGE_MULTIPLIER = 5
+BACKTEST_ENTRY_DTE = 45
+BACKTEST_OPTION_TIME_VALUE_PERCENT = 0.12
 OPTION_STOP_LOSS_PERCENT = 0.50
 OPTION_TAKE_PROFIT_PERCENT = 1.00
 MAX_HOLDING_DAYS = 20
