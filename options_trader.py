@@ -1,4 +1,5 @@
 from datetime import date, datetime, timedelta
+import re
 
 import yfinance as yf
 from alpaca.data.enums import OptionsFeed
@@ -35,9 +36,16 @@ from config import (
     MIN_OPTION_VOLUME,
     OPTION_DATA_FEED,
     TARGET_DELTA,
+    ALLOW_DUPLICATE_CONTRACTS,
+    ALLOW_MULTIPLE_CONTRACTS_PER_UNDERLYING,
+    EXIT_DTE,
+    MAX_PREMIUM_PER_TRADE,
+    MAX_TOTAL_OPTION_PREMIUM,
+    OPTION_STOP_LOSS_PERCENT,
+    OPTION_TRAILING_STOP_PERCENT,
     require_alpaca_credentials
 )
-from analytics import get_latest_entry_price, record_event
+from analytics import get_latest_entry_price, get_owned_option_symbols, record_event, summarize_results
 from bot_logger import bot_log
 
 API_KEY, SECRET_KEY = require_alpaca_credentials()
@@ -65,11 +73,38 @@ def _to_float(value):
         return None
 
 
-def get_open_positions_count():
+OPTION_SYMBOL_RE = re.compile(r"^([A-Z.]+)(\d{6})([CP])(\d{8})$")
+CONTRACT_MULTIPLIER = 100
+_high_water_marks = {}
+
+
+def parse_option_symbol(symbol):
+    match = OPTION_SYMBOL_RE.match(symbol or "")
+    if not match:
+        return None
+    underlying, expiration, option_type, strike = match.groups()
+    return {
+        "underlying": underlying,
+        "expiration": datetime.strptime(expiration, "%y%m%d").date(),
+        "option_type": "call" if option_type == "C" else "put",
+        "strike": int(strike) / 1000,
+    }
+
+
+def get_options_direct_positions():
     try:
-        return len(trading_client.get_all_positions())
-    except Exception:
-        return 0
+        owned = get_owned_option_symbols()
+        return [
+            position for position in trading_client.get_all_positions()
+            if position.symbol in owned and parse_option_symbol(position.symbol)
+        ]
+    except Exception as e:
+        bot_log(f"Could not retrieve OptionsDirect positions: {e}")
+        return []
+
+
+def get_open_positions_count():
+    return len(get_options_direct_positions())
 
 
 def has_open_order(symbol):
@@ -81,17 +116,51 @@ def has_open_order(symbol):
 
 
 def already_holding_underlying(underlying):
-    try:
-        positions = trading_client.get_all_positions()
+    return any(
+        parse_option_symbol(position.symbol)["underlying"] == underlying
+        for position in get_options_direct_positions()
+    )
 
-        for position in positions:
-            if position.symbol.startswith(underlying):
-                return True
 
-        return False
+def log_open_option_positions():
+    positions = get_options_direct_positions()
+    bot_log(f"OptionsDirect open option positions: {len(positions)}")
+    for position in positions:
+        parsed = parse_option_symbol(position.symbol)
+        qty = _to_float(getattr(position, "qty", None)) or 0
+        avg = _to_float(getattr(position, "avg_entry_price", None)) or 0
+        current = _to_float(getattr(position, "current_price", None)) or 0
+        market_value = _to_float(getattr(position, "market_value", None))
+        if market_value is None:
+            market_value = qty * current * CONTRACT_MULTIPLIER
+        pnl = _to_float(getattr(position, "unrealized_pl", None)) or 0
+        pnl_pct = _to_float(getattr(position, "unrealized_plpc", None)) or 0
+        dte = (parsed["expiration"] - date.today()).days
+        bot_log(
+            "OPEN_POSITION "
+            f"contract={position.symbol} underlying={parsed['underlying']} "
+            f"type={parsed['option_type']} strike={parsed['strike']:.3f} "
+            f"expiration={parsed['expiration']} dte={dte} qty={qty:g} "
+            f"avg_entry=${avg:.2f} current=${current:.2f} market_value=${market_value:.2f} "
+            f"unrealized_pl=${pnl:.2f} unrealized_pl_pct={pnl_pct:.2%}"
+        )
+        record_event(
+            "POSITION_SNAPSHOT", underlying=parsed["underlying"],
+            option_symbol=position.symbol, qty=qty, price=current,
+            unrealized_pnl=pnl,
+            details=f"market_value={market_value:.2f};unrealized_pct={pnl_pct:.6f};dte={dte}"
+        )
+    return positions
 
-    except Exception:
-        return False
+
+def log_analytics_summary():
+    results = summarize_results()
+    for grouping, buckets in results.items():
+        for symbol, values in sorted(buckets.items()):
+            bot_log(
+                f"RESULTS {grouping}={symbol} realized_pl=${values['realized_pnl']:.2f} "
+                f"unrealized_pl=${values['unrealized_pnl']:.2f}"
+            )
 
 
 def has_earnings_soon(underlying, skip_days=EARNINGS_SKIP_DAYS):
@@ -336,28 +405,46 @@ def get_option_contract(underlying, option_type="call", min_dte=30, max_dte=60):
 
     ranked.sort(key=lambda item: item[0])
     _, selected, selected_snapshot, selected_volume = ranked[0]
-    selected_delta = _to_float(getattr(selected_snapshot.greeks, "delta", None))
-    selected_spread = bid_ask_spread_pct(selected_snapshot.latest_quote)
-
-    bot_log(f"Selected contract: {selected.symbol}")
-    bot_log(f"Expiration: {selected.expiration_date}")
-    bot_log(f"Strike: {selected.strike_price}")
-    bot_log(f"Open interest: {selected.open_interest}")
-    bot_log(f"Volume: {selected_volume}")
-    bot_log(f"Bid/ask spread: {selected_spread:.2%}")
-    bot_log(f"Delta: {selected_delta:.2f}")
+    greeks = getattr(selected_snapshot, "greeks", None)
+    quote = getattr(selected_snapshot, "latest_quote", None)
+    bid = _to_float(getattr(quote, "bid_price", None)) or 0
+    ask = _to_float(getattr(quote, "ask_price", None)) or 0
+    midpoint = (bid + ask) / 2
+    spread_dollars = ask - bid
+    selected_spread = bid_ask_spread_pct(quote) or 0
+    selected_delta = _to_float(getattr(greeks, "delta", None))
+    gamma = _to_float(getattr(greeks, "gamma", None))
+    theta = _to_float(getattr(greeks, "theta", None))
+    iv = _to_float(getattr(selected_snapshot, "implied_volatility", None))
+    dte = (selected.expiration_date - today).days
+    selection_reason = (
+        "best rank by delta distance, spread, volume, DTE, and strike distance "
+        "after unchanged liquidity and Greek filters"
+    )
+    bot_log(
+        "CONTRACT_SELECTED "
+        f"underlying={underlying} underlying_price=${underlying_price:.2f} "
+        f"contract={selected.symbol} strike={float(selected.strike_price):.3f} "
+        f"expiration={selected.expiration_date} dte={dte} bid=${bid:.2f} ask=${ask:.2f} "
+        f"midpoint=${midpoint:.2f} spread_dollars=${spread_dollars:.2f} "
+        f"spread_pct={selected_spread:.2%} delta={selected_delta:.4f} "
+        f"gamma={gamma if gamma is not None else 'N/A'} theta={theta if theta is not None else 'N/A'} "
+        f"iv={iv if iv is not None else 'N/A'} volume={selected_volume} "
+        f"open_interest={selected.open_interest} reason=\"{selection_reason}\""
+    )
     record_event(
         "CONTRACT_SELECTED",
         underlying=underlying,
         option_symbol=selected.symbol,
         price=underlying_price,
         details=(
-            f"expiration={selected.expiration_date};"
+            f"underlying_price={underlying_price};expiration={selected.expiration_date};dte={dte};"
             f"strike={selected.strike_price};"
             f"open_interest={selected.open_interest};"
             f"volume={selected_volume};"
-            f"spread={selected_spread:.4f};"
-            f"delta={selected_delta:.4f}"
+            f"bid={bid};ask={ask};midpoint={midpoint};spread_dollars={spread_dollars};"
+            f"spread_pct={selected_spread:.6f};delta={selected_delta:.6f};"
+            f"gamma={gamma};theta={theta};iv={iv};selection_reason={selection_reason}"
         )
     )
 
@@ -365,6 +452,35 @@ def get_option_contract(underlying, option_type="call", min_dte=30, max_dte=60):
 
 
 def buy_option_contract(option_symbol, qty=1, underlying=""):
+    positions = get_options_direct_positions()
+    parsed = parse_option_symbol(option_symbol)
+    held_symbols = {position.symbol for position in positions}
+    try:
+        bot_orders = [
+            order for order in trading_client.get_orders()
+            if str(getattr(order, "client_order_id", "")).startswith("optionsdirect-")
+        ]
+    except Exception:
+        bot_orders = []
+    pending_symbols = {getattr(order, "symbol", "") for order in bot_orders}
+    if not ALLOW_DUPLICATE_CONTRACTS and option_symbol in held_symbols | pending_symbols:
+        bot_log(f"Duplicate contract blocked: {option_symbol}")
+        record_event("SKIP", underlying=underlying, option_symbol=option_symbol, reason="duplicate_contract")
+        return
+    if (
+        not ALLOW_MULTIPLE_CONTRACTS_PER_UNDERLYING
+        and parsed
+        and any(
+            parsed_order and parsed_order["underlying"] == parsed["underlying"]
+            for parsed_order in (
+                parse_option_symbol(symbol) for symbol in held_symbols | pending_symbols
+            )
+        )
+    ):
+        bot_log(f"Additional contract for {underlying} blocked by configuration.")
+        record_event("SKIP", underlying=underlying, option_symbol=option_symbol, reason="multiple_underlying_contracts")
+        return
+
     if has_open_order(option_symbol):
         bot_log(f"Open order exists for {option_symbol}. Skipping.")
         record_event(
@@ -375,11 +491,37 @@ def buy_option_contract(option_symbol, qty=1, underlying=""):
         )
         return
 
+    snapshots = get_option_snapshots([option_symbol])
+    snapshot = snapshots.get(option_symbol)
+    quote = getattr(snapshot, "latest_quote", None)
+    bid = _to_float(getattr(quote, "bid_price", None)) or 0
+    ask = _to_float(getattr(quote, "ask_price", None)) or 0
+    estimated_price = (bid + ask) / 2 if bid > 0 and ask > 0 else ask
+    estimated_premium = estimated_price * qty * CONTRACT_MULTIPLIER
+    current_total = sum(
+        (_to_float(getattr(p, "avg_entry_price", None)) or 0)
+        * abs(_to_float(getattr(p, "qty", None)) or 0) * CONTRACT_MULTIPLIER
+        for p in positions
+    )
+    if estimated_premium <= 0:
+        bot_log(f"Cannot price {option_symbol} for premium risk checks. Skipping.")
+        record_event("SKIP", underlying=underlying, option_symbol=option_symbol, reason="missing_option_price")
+        return
+    if estimated_premium > MAX_PREMIUM_PER_TRADE:
+        bot_log(f"Premium limit blocked {option_symbol}: estimated=${estimated_premium:.2f}, MAX_PREMIUM_PER_TRADE=${MAX_PREMIUM_PER_TRADE:.2f}")
+        record_event("SKIP", underlying=underlying, option_symbol=option_symbol, reason="max_premium_per_trade", details=f"estimated_premium={estimated_premium:.2f}")
+        return
+    if current_total + estimated_premium > MAX_TOTAL_OPTION_PREMIUM:
+        bot_log(f"Total premium limit blocked {option_symbol}: current=${current_total:.2f}, proposed=${estimated_premium:.2f}, MAX_TOTAL_OPTION_PREMIUM=${MAX_TOTAL_OPTION_PREMIUM:.2f}")
+        record_event("SKIP", underlying=underlying, option_symbol=option_symbol, reason="max_total_option_premium")
+        return
+
     order = MarketOrderRequest(
         symbol=option_symbol,
         qty=qty,
         side=OrderSide.BUY,
-        time_in_force=TimeInForce.DAY
+        time_in_force=TimeInForce.DAY,
+        client_order_id=f"optionsdirect-{option_symbol}-{int(datetime.now().timestamp())}"
     )
 
     try:
@@ -392,7 +534,8 @@ def buy_option_contract(option_symbol, qty=1, underlying=""):
             option_symbol=option_symbol,
             qty=qty,
             price=underlying_price,
-            details=f"order_id={getattr(submitted_order, 'id', '')}"
+            details=(f"order_id={getattr(submitted_order, 'id', '')};"
+                     f"underlying_price={underlying_price};estimated_premium={estimated_premium:.2f}")
         )
 
     except (APIError, RequestException) as e:
@@ -408,16 +551,9 @@ def buy_option_contract(option_symbol, qty=1, underlying=""):
 
 
 def get_option_positions_for_underlying(underlying):
-    try:
-        positions = trading_client.get_all_positions()
-    except Exception as e:
-        bot_log(f"Could not get positions for exits: {e}")
-        return []
-
     return [
-        position
-        for position in positions
-        if position.symbol != underlying and position.symbol.startswith(underlying)
+        position for position in get_options_direct_positions()
+        if parse_option_symbol(position.symbol)["underlying"] == underlying
     ]
 
 
@@ -443,6 +579,7 @@ def close_option_position(position, underlying, reason):
             option_symbol=position.symbol,
             qty=qty,
             price=get_underlying_price(underlying) or "",
+            unrealized_pnl=_to_float(getattr(position, "unrealized_pl", None)) or 0,
             reason=reason,
             details=f"order_id={getattr(submitted_order, 'id', '')}"
         )
@@ -477,6 +614,24 @@ def manage_underlying_exits(
         for position in positions:
             exit_reason = technical_reason if technical_exit else ""
             entry_price = get_latest_entry_price(underlying, position.symbol)
+            parsed = parse_option_symbol(position.symbol)
+            dte = (parsed["expiration"] - date.today()).days
+            option_price = _to_float(getattr(position, "current_price", None)) or 0
+            option_plpc = _to_float(getattr(position, "unrealized_plpc", None)) or 0
+            high_water = max(_high_water_marks.get(position.symbol, option_price), option_price)
+            _high_water_marks[position.symbol] = high_water
+
+            if dte <= EXIT_DTE:
+                exit_reason = f"expiration_management_dte_{dte}"
+            elif option_plpc <= -OPTION_STOP_LOSS_PERCENT:
+                exit_reason = f"option_stop_loss_{option_plpc:.2%}"
+            elif (
+                OPTION_TRAILING_STOP_PERCENT > 0
+                and high_water > 0
+                and option_price <= high_water * (1 - OPTION_TRAILING_STOP_PERCENT)
+            ):
+                drawdown = (option_price - high_water) / high_water
+                exit_reason = f"option_trailing_stop_{drawdown:.2%}"
 
             if current_price and entry_price:
                 change_pct = (current_price - entry_price) / entry_price
@@ -488,3 +643,8 @@ def manage_underlying_exits(
 
             if exit_reason:
                 close_option_position(position, underlying, exit_reason)
+
+    open_symbols = {position.symbol for position in get_options_direct_positions()}
+    for symbol in list(_high_water_marks):
+        if symbol not in open_symbols:
+            del _high_water_marks[symbol]

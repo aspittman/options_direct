@@ -85,7 +85,27 @@ UNDERLYINGS = [
 ]
 
 DOLLARS_PER_TRADE = 100
-MAX_POSITIONS = 2
+
+
+def _env_bool(name, default=False):
+    return os.getenv(name, str(default)).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name, default):
+    return int(os.getenv(name, str(default)))
+
+
+def _env_float(name, default):
+    return float(os.getenv(name, str(default)))
+
+
+MAX_POSITIONS = _env_int("MAX_POSITIONS", 2)
+MAX_PREMIUM_PER_TRADE = _env_float("MAX_PREMIUM_PER_TRADE", DOLLARS_PER_TRADE)
+MAX_TOTAL_OPTION_PREMIUM = _env_float("MAX_TOTAL_OPTION_PREMIUM", 500.0)
+ALLOW_DUPLICATE_CONTRACTS = _env_bool("ALLOW_DUPLICATE_CONTRACTS", False)
+ALLOW_MULTIPLE_CONTRACTS_PER_UNDERLYING = _env_bool(
+    "ALLOW_MULTIPLE_CONTRACTS_PER_UNDERLYING", False
+)
 
 MA_SHORT = 50
 MA_LONG = 200
@@ -114,8 +134,10 @@ UNDERLYING_TAKE_PROFIT_PCT = 0.08
 
 BACKTEST_ENTRY_DTE = 45
 BACKTEST_OPTION_TIME_VALUE_PERCENT = 0.12
-OPTION_STOP_LOSS_PERCENT = 0.50
+OPTION_STOP_LOSS_PERCENT = _env_float("OPTION_STOP_LOSS_PERCENT", 0.50)
+OPTION_TRAILING_STOP_PERCENT = _env_float("OPTION_TRAILING_STOP_PERCENT", 0.25)
 OPTION_TAKE_PROFIT_PERCENT = 1.00
+EXIT_DTE = _env_int("EXIT_DTE", 7)
 MAX_HOLDING_DAYS = 20
 
 OPTION_TYPE = "call"  # start with calls only

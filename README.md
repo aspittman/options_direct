@@ -28,6 +28,25 @@ Run the bot:
 python main.py
 ```
 
+Optional option-risk settings (shown with defaults):
+
+```bash
+EXIT_DTE=7
+OPTION_STOP_LOSS_PERCENT=0.50
+OPTION_TRAILING_STOP_PERCENT=0.25
+MAX_PREMIUM_PER_TRADE=100
+MAX_TOTAL_OPTION_PREMIUM=500
+MAX_POSITIONS=2
+ALLOW_DUPLICATE_CONTRACTS=false
+ALLOW_MULTIPLE_CONTRACTS_PER_UNDERLYING=false
+```
+
+Percent settings are decimal fractions. Position limits and premium totals apply
+only to option contracts submitted by OptionsDirect; stock positions and other
+bots' positions are excluded. The analytics CSV records realized and unrealized
+P/L in separate columns and the cycle log reports results both by contract and
+by underlying.
+
 Run the options backtester:
 
 ```bash

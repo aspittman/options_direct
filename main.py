@@ -37,7 +37,9 @@ from options_trader import (
     has_earnings_soon,
     get_option_contract,
     manage_underlying_exits,
-    buy_option_contract
+    buy_option_contract,
+    log_open_option_positions,
+    log_analytics_summary,
 )
 
 
@@ -48,6 +50,8 @@ def run_bot():
     bot_log("Starting options paper trading bot...")
 
     while True:
+        log_open_option_positions()
+        log_analytics_summary()
         manage_underlying_exits(
             UNDERLYINGS,
             lambda symbol: is_underlying_exit_signal(
@@ -85,8 +89,18 @@ def run_bot():
                 continue
 
             if get_open_positions_count() >= MAX_POSITIONS:
+                open_positions = log_open_option_positions()
+                position_symbols = [position.symbol for position in open_positions]
+                bot_log(
+                    f"Position limit: MAX_POSITIONS={MAX_POSITIONS}, "
+                    f"open_option_positions={len(open_positions)}, symbols={position_symbols}"
+                )
                 bot_log("Max positions reached.")
-                record_event("SKIP", underlying=underlying, reason="max_positions")
+                record_event(
+                    "SKIP", underlying=underlying, reason="max_positions",
+                    details=(f"MAX_POSITIONS={MAX_POSITIONS};count={len(open_positions)};"
+                             f"symbols={','.join(position_symbols)}")
+                )
                 break
 
             if already_holding_underlying(underlying):
