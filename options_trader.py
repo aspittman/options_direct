@@ -36,16 +36,20 @@ from config import (
     MIN_OPTION_VOLUME,
     OPTION_DATA_FEED,
     TARGET_DELTA,
-    ALLOW_DUPLICATE_CONTRACTS,
     ALLOW_MULTIPLE_CONTRACTS_PER_UNDERLYING,
     EXIT_DTE,
-    MAX_PREMIUM_PER_TRADE,
     MAX_TOTAL_OPTION_PREMIUM,
     OPTION_STOP_LOSS_PERCENT,
     OPTION_TRAILING_STOP_PERCENT,
     require_alpaca_credentials
 )
-from analytics import get_latest_entry_price, get_owned_option_symbols, record_event, summarize_results
+from analytics import (
+    get_owned_option_symbols,
+    get_strategy_open_lots,
+    get_submitted_orders,
+    record_event,
+    summarize_results,
+)
 from bot_logger import bot_log
 
 API_KEY, SECRET_KEY = require_alpaca_credentials()
@@ -322,8 +326,11 @@ def get_option_contract(underlying, option_type="call", min_dte=30, max_dte=60):
         expiration_date_gte=min_exp,
         expiration_date_lte=max_exp,
         type=contract_type,
-        strike_price_gte=underlying_price * 0.85,
-        strike_price_lte=underlying_price * 1.15,
+        # alpaca-py models strike filters as strings (even though they contain
+        # numeric values). Passing floats fails Pydantic validation before the
+        # API request is made.
+        strike_price_gte=f"{underlying_price * 0.85:.2f}",
+        strike_price_lte=f"{underlying_price * 1.15:.2f}",
         limit=1000
     )
 
@@ -451,44 +458,113 @@ def get_option_contract(underlying, option_type="call", min_dte=30, max_dte=60):
     return selected.symbol
 
 
-def buy_option_contract(option_symbol, qty=1, underlying=""):
+def _strategy_has_pending_order(strategy, option_symbol, side=None):
+    for row in get_submitted_orders().values():
+        if row.get("strategy") != strategy or row.get("option_symbol") != option_symbol:
+            continue
+        if side is None or row.get("order_side") == side:
+            return True
+    return False
+
+
+def reconcile_order_fills():
+    """Record confirmed Alpaca fills so performance uses paper execution prices."""
+    for order_id, submitted in get_submitted_orders().items():
+        try:
+            order = trading_client.get_order_by_id(order_id)
+        except (APIError, RequestException) as exc:
+            bot_log(f"Could not reconcile order {order_id}: {exc}")
+            continue
+        raw_status = getattr(order, "status", "")
+        status = str(getattr(raw_status, "value", raw_status))
+        filled_qty = _to_float(getattr(order, "filled_qty", None)) or 0
+        fill_price = _to_float(getattr(order, "filled_avg_price", None)) or 0
+        terminal_statuses = {"canceled", "expired", "rejected", "failed"}
+        if (
+            status.lower() == "filled" or status.lower() in terminal_statuses
+        ) and filled_qty > 0 and fill_price > 0:
+            record_event(
+                "ORDER_FILL",
+                strategy=submitted.get("strategy", ""),
+                underlying=submitted.get("underlying", ""),
+                option_symbol=submitted.get("option_symbol", ""),
+                qty=filled_qty,
+                price=fill_price,
+                underlying_price=submitted.get("underlying_price", ""),
+                order_id=order_id,
+                order_side=submitted.get("order_side", ""),
+                order_status=status,
+            )
+            bot_log(
+                f"PAPER_FILL strategy={submitted.get('strategy')} side={submitted.get('order_side')} "
+                f"contract={submitted.get('option_symbol')} qty={filled_qty:g} price=${fill_price:.2f}"
+            )
+        elif status.lower() in terminal_statuses:
+            record_event(
+                "ORDER_TERMINAL",
+                strategy=submitted.get("strategy", ""),
+                underlying=submitted.get("underlying", ""),
+                option_symbol=submitted.get("option_symbol", ""),
+                order_id=order_id,
+                order_side=submitted.get("order_side", ""),
+                order_status=status,
+                reason="unfilled_terminal_order",
+            )
+
+
+def bootstrap_legacy_positions():
+    """Adopt pre-ledger bot positions as regular lots without double-counting pending buys."""
+    lots = get_strategy_open_lots()
+    tracked_qty = {}
+    for (_, _, symbol), lot in lots.items():
+        tracked_qty[symbol] = tracked_qty.get(symbol, 0) + lot["qty"]
+    pending_symbols = {
+        row.get("option_symbol", "") for row in get_submitted_orders().values()
+        if row.get("order_side") == "buy"
+    }
+    for position in get_options_direct_positions():
+        symbol = position.symbol
+        account_qty = _to_float(getattr(position, "qty", None)) or 0
+        missing_qty = account_qty - tracked_qty.get(symbol, 0)
+        if missing_qty <= 0 or symbol in pending_symbols:
+            continue
+        parsed = parse_option_symbol(symbol)
+        entry_price = _to_float(getattr(position, "avg_entry_price", None)) or 0
+        if not parsed or entry_price <= 0:
+            continue
+        underlying = parsed["underlying"]
+        record_event(
+            "ORDER_FILL", strategy="regular", underlying=underlying,
+            option_symbol=symbol, qty=missing_qty, price=entry_price,
+            underlying_price=get_underlying_price(underlying) or "",
+            order_id=f"legacy-{symbol}", order_side="buy", order_status="filled",
+            details="adopted pre-strategy-ledger paper position",
+        )
+        bot_log(f"Adopted legacy paper position as regular: {symbol} qty={missing_qty:g}")
+
+
+def buy_option_contract(
+    option_symbol, qty=1, underlying="", strategy="regular", max_entry_premium=None
+):
     positions = get_options_direct_positions()
     parsed = parse_option_symbol(option_symbol)
-    held_symbols = {position.symbol for position in positions}
-    try:
-        bot_orders = [
-            order for order in trading_client.get_orders()
-            if str(getattr(order, "client_order_id", "")).startswith("optionsdirect-")
-        ]
-    except Exception:
-        bot_orders = []
-    pending_symbols = {getattr(order, "symbol", "") for order in bot_orders}
-    if not ALLOW_DUPLICATE_CONTRACTS and option_symbol in held_symbols | pending_symbols:
+    strategy_lots = get_strategy_open_lots()
+    strategy_holds_symbol = any(
+        lot_strategy == strategy and symbol == option_symbol
+        for lot_strategy, _, symbol in strategy_lots
+    )
+    if strategy_holds_symbol or _strategy_has_pending_order(strategy, option_symbol, "buy"):
         bot_log(f"Duplicate contract blocked: {option_symbol}")
-        record_event("SKIP", underlying=underlying, option_symbol=option_symbol, reason="duplicate_contract")
+        record_event("SKIP", strategy=strategy, underlying=underlying, option_symbol=option_symbol, reason="duplicate_contract")
         return
     if (
         not ALLOW_MULTIPLE_CONTRACTS_PER_UNDERLYING
         and parsed
-        and any(
-            parsed_order and parsed_order["underlying"] == parsed["underlying"]
-            for parsed_order in (
-                parse_option_symbol(symbol) for symbol in held_symbols | pending_symbols
-            )
-        )
+        and any(lot_strategy == strategy and lot_underlying == underlying
+                for lot_strategy, lot_underlying, _ in strategy_lots)
     ):
-        bot_log(f"Additional contract for {underlying} blocked by configuration.")
-        record_event("SKIP", underlying=underlying, option_symbol=option_symbol, reason="multiple_underlying_contracts")
-        return
-
-    if has_open_order(option_symbol):
-        bot_log(f"Open order exists for {option_symbol}. Skipping.")
-        record_event(
-            "SKIP",
-            underlying=underlying,
-            option_symbol=option_symbol,
-            reason="open_order_exists"
-        )
+        bot_log(f"Additional contract for strategy={strategy} {underlying} blocked by configuration.")
+        record_event("SKIP", strategy=strategy, underlying=underlying, option_symbol=option_symbol, reason="multiple_underlying_contracts")
         return
 
     snapshots = get_option_snapshots([option_symbol])
@@ -507,9 +583,9 @@ def buy_option_contract(option_symbol, qty=1, underlying=""):
         bot_log(f"Cannot price {option_symbol} for premium risk checks. Skipping.")
         record_event("SKIP", underlying=underlying, option_symbol=option_symbol, reason="missing_option_price")
         return
-    if estimated_premium > MAX_PREMIUM_PER_TRADE:
-        bot_log(f"Premium limit blocked {option_symbol}: estimated=${estimated_premium:.2f}, MAX_PREMIUM_PER_TRADE=${MAX_PREMIUM_PER_TRADE:.2f}")
-        record_event("SKIP", underlying=underlying, option_symbol=option_symbol, reason="max_premium_per_trade", details=f"estimated_premium={estimated_premium:.2f}")
+    if max_entry_premium is not None and estimated_premium > max_entry_premium:
+        bot_log(f"Premium limit blocked strategy={strategy} {option_symbol}: estimated=${estimated_premium:.2f}, limit=${max_entry_premium:.2f}")
+        record_event("SKIP", strategy=strategy, underlying=underlying, option_symbol=option_symbol, reason="max_premium_per_trade", details=f"estimated_premium={estimated_premium:.2f};limit={max_entry_premium:.2f}")
         return
     if current_total + estimated_premium > MAX_TOTAL_OPTION_PREMIUM:
         bot_log(f"Total premium limit blocked {option_symbol}: current=${current_total:.2f}, proposed=${estimated_premium:.2f}, MAX_TOTAL_OPTION_PREMIUM=${MAX_TOTAL_OPTION_PREMIUM:.2f}")
@@ -521,7 +597,7 @@ def buy_option_contract(option_symbol, qty=1, underlying=""):
         qty=qty,
         side=OrderSide.BUY,
         time_in_force=TimeInForce.DAY,
-        client_order_id=f"optionsdirect-{option_symbol}-{int(datetime.now().timestamp())}"
+        client_order_id=f"od-{strategy}-{int(datetime.now().timestamp() * 1000)}"
     )
 
     try:
@@ -529,11 +605,16 @@ def buy_option_contract(option_symbol, qty=1, underlying=""):
         underlying_price = get_underlying_price(underlying) if underlying else ""
         bot_log(f"Placed BUY order for {qty} option contract(s): {option_symbol}")
         record_event(
-            "BUY_SUBMITTED",
+            "ORDER_SUBMITTED",
+            strategy=strategy,
             underlying=underlying,
             option_symbol=option_symbol,
             qty=qty,
-            price=underlying_price,
+            price=estimated_price,
+            underlying_price=underlying_price,
+            order_id=str(getattr(submitted_order, "id", "")),
+            order_side="buy",
+            order_status=str(getattr(submitted_order, "status", "")),
             details=(f"order_id={getattr(submitted_order, 'id', '')};"
                      f"underlying_price={underlying_price};estimated_premium={estimated_premium:.2f}")
         )
@@ -596,30 +677,76 @@ def close_option_position(position, underlying, reason):
         )
 
 
+def close_strategy_lot(strategy, underlying, option_symbol, qty, reason):
+    """Sell only the quantity assigned to one virtual strategy."""
+    if _strategy_has_pending_order(strategy, option_symbol, "sell"):
+        return
+    order = MarketOrderRequest(
+        symbol=option_symbol,
+        qty=qty,
+        side=OrderSide.SELL,
+        time_in_force=TimeInForce.DAY,
+        client_order_id=f"od-{strategy}-x-{int(datetime.now().timestamp() * 1000)}",
+    )
+    try:
+        submitted = trading_client.submit_order(order)
+        record_event(
+            "ORDER_SUBMITTED",
+            strategy=strategy,
+            underlying=underlying,
+            option_symbol=option_symbol,
+            qty=qty,
+            underlying_price=get_underlying_price(underlying) or "",
+            reason=reason,
+            order_id=str(getattr(submitted, "id", "")),
+            order_side="sell",
+            order_status=str(getattr(submitted, "status", "")),
+        )
+        bot_log(
+            f"Submitted PAPER SELL strategy={strategy} contract={option_symbol} qty={qty:g}: {reason}"
+        )
+    except (APIError, RequestException) as exc:
+        bot_log(f"Strategy exit failed strategy={strategy} contract={option_symbol}: {exc}")
+        record_event(
+            "ORDER_FAILED", strategy=strategy, underlying=underlying,
+            option_symbol=option_symbol, qty=qty, reason="exit_failed", details=str(exc)
+        )
+
+
 def manage_underlying_exits(
     underlyings,
     exit_signal_func,
     stop_loss_pct,
     take_profit_pct
 ):
+    positions_by_symbol = {
+        position.symbol: position for position in get_options_direct_positions()
+    }
+    lots = get_strategy_open_lots()
     for underlying in underlyings:
-        positions = get_option_positions_for_underlying(underlying)
-
-        if not positions:
+        underlying_lots = [
+            (key, lot) for key, lot in lots.items() if key[1] == underlying
+        ]
+        if not underlying_lots:
             continue
 
         current_price = get_underlying_price(underlying)
         technical_exit, technical_reason = exit_signal_func(underlying)
 
-        for position in positions:
+        for (strategy, _, option_symbol), lot in underlying_lots:
+            position = positions_by_symbol.get(option_symbol)
+            if position is None:
+                continue
             exit_reason = technical_reason if technical_exit else ""
-            entry_price = get_latest_entry_price(underlying, position.symbol)
-            parsed = parse_option_symbol(position.symbol)
+            entry_price = lot["underlying_cost"] / lot["qty"] if lot["qty"] else 0
+            parsed = parse_option_symbol(option_symbol)
             dte = (parsed["expiration"] - date.today()).days
             option_price = _to_float(getattr(position, "current_price", None)) or 0
-            option_plpc = _to_float(getattr(position, "unrealized_plpc", None)) or 0
-            high_water = max(_high_water_marks.get(position.symbol, option_price), option_price)
-            _high_water_marks[position.symbol] = high_water
+            option_entry = lot["cost"] / lot["qty"] if lot["qty"] else 0
+            option_plpc = (option_price - option_entry) / option_entry if option_entry else 0
+            high_water_key = (strategy, option_symbol)
+            high_water = max(_high_water_marks.get(high_water_key, option_price), option_price)
+            _high_water_marks[high_water_key] = high_water
 
             if dte <= EXIT_DTE:
                 exit_reason = f"expiration_management_dte_{dte}"
@@ -642,9 +769,11 @@ def manage_underlying_exits(
                     exit_reason = f"underlying_take_profit_{change_pct:.2%}"
 
             if exit_reason:
-                close_option_position(position, underlying, exit_reason)
+                close_strategy_lot(
+                    strategy, underlying, option_symbol, lot["qty"], exit_reason
+                )
 
-    open_symbols = {position.symbol for position in get_options_direct_positions()}
-    for symbol in list(_high_water_marks):
-        if symbol not in open_symbols:
-            del _high_water_marks[symbol]
+    open_keys = {(strategy, symbol) for strategy, _, symbol in lots}
+    for key in list(_high_water_marks):
+        if key not in open_keys:
+            del _high_water_marks[key]

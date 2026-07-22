@@ -19,12 +19,16 @@ from config import (
     OPTION_TAKE_PROFIT_PERCENT,
     TARGET_DELTA,
     UNDERLYINGS,
+    PAPER_STRATEGIES,
 )
 
 
 RESULTS_FILE = Path("logs/options_backtest_trades.csv")
 EQUITY_CURVE_FILE = Path("logs/options_backtest_equity_curve.csv")
+CHEAP_RESULTS_FILE = Path("logs/options_backtest_trades_100_max.csv")
+CHEAP_EQUITY_CURVE_FILE = Path("logs/options_backtest_equity_curve_100_max.csv")
 CONTRACT_MULTIPLIER = 100
+CHEAP_MAX_PREMIUM = 100.0
 YEARS_TO_PERIOD = {1: "1y", 3: "3y", 5: "5y"}
 
 FIELDNAMES = [
@@ -245,12 +249,7 @@ def build_trade(symbol, close, entry_index, exit_index, exit_reason, option_posi
     }
 
 
-def backtest_symbol(symbol, period, interval):
-    close = get_close_series(symbol, period, interval)
-    if close is None:
-        print(f"{symbol}: no historical data")
-        return []
-
+def backtest_close(symbol, close, max_entry_premium=None):
     minimum_bars = max(MA_LONG, MACD_SLOW + MACD_SIGNAL) + 5
     if len(close) < minimum_bars:
         print(f"{symbol}: not enough historical data ({len(close)} bars)")
@@ -264,8 +263,11 @@ def backtest_symbol(symbol, period, interval):
     for index in range(minimum_bars, len(close)):
         if entry_index is None:
             if is_bullish_at(close, indicators, index):
-                entry_index = index
-                option_position = build_option_position(float(close.iloc[index]))
+                candidate = build_option_position(float(close.iloc[index]))
+                entry_premium = candidate["entry_price"] * CONTRACT_MULTIPLIER
+                if max_entry_premium is None or entry_premium <= max_entry_premium:
+                    entry_index = index
+                    option_position = candidate
             continue
 
         option_entry_price = option_position["entry_price"]
@@ -312,9 +314,18 @@ def backtest_symbol(symbol, period, interval):
     return trades
 
 
-def save_trades(trades):
-    RESULTS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with RESULTS_FILE.open("w", newline="") as file:
+def backtest_symbol(symbol, period, interval, max_entry_premium=None):
+    close = get_close_series(symbol, period, interval)
+    if close is None:
+        print(f"{symbol}: no historical data")
+        return []
+
+    return backtest_close(symbol, close, max_entry_premium)
+
+
+def save_trades(trades, results_file=RESULTS_FILE):
+    results_file.parent.mkdir(parents=True, exist_ok=True)
+    with results_file.open("w", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=FIELDNAMES)
         writer.writeheader()
         writer.writerows(trades)
@@ -342,9 +353,9 @@ def build_equity_curve(trades):
     return equity_curve
 
 
-def save_equity_curve(equity_curve):
-    EQUITY_CURVE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with EQUITY_CURVE_FILE.open("w", newline="") as file:
+def save_equity_curve(equity_curve, equity_curve_file=EQUITY_CURVE_FILE):
+    equity_curve_file.parent.mkdir(parents=True, exist_ok=True)
+    with equity_curve_file.open("w", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=EQUITY_FIELDNAMES)
         writer.writeheader()
         writer.writerows(equity_curve)
@@ -357,9 +368,9 @@ def max_drawdown(equity_curve):
     return abs(min(float(point["drawdown"]) for point in equity_curve))
 
 
-def print_summary(trades):
-    print("\nOptions Backtest Summary")
-    print("========================")
+def print_summary(trades, title="Options Backtest Summary"):
+    print(f"\n{title}")
+    print("=" * len(title))
 
     total_trades = len(trades)
     print(f"Total trades: {total_trades}")
@@ -417,18 +428,68 @@ def print_summary(trades):
 
 
 def run_backtest(period, interval):
-    all_trades = []
+    regular_trades = []
+    cheap_trades = []
 
     for symbol in UNDERLYINGS:
         print(f"Backtesting {symbol}...")
-        all_trades.extend(backtest_symbol(symbol, period, interval))
+        close = get_close_series(symbol, period, interval)
+        if close is None:
+            print(f"{symbol}: no historical data")
+            continue
+        regular_trades.extend(backtest_close(symbol, close))
+        cheap_trades.extend(backtest_close(symbol, close, CHEAP_MAX_PREMIUM))
 
-    equity_curve = build_equity_curve(all_trades)
-    save_trades(all_trades)
-    save_equity_curve(equity_curve)
-    print_summary(all_trades)
-    print(f"\nSaved trades to {RESULTS_FILE}")
-    print(f"Saved equity curve to {EQUITY_CURVE_FILE}")
+    regular_equity_curve = build_equity_curve(regular_trades)
+    cheap_equity_curve = build_equity_curve(cheap_trades)
+    save_trades(regular_trades, RESULTS_FILE)
+    save_equity_curve(regular_equity_curve, EQUITY_CURVE_FILE)
+    save_trades(cheap_trades, CHEAP_RESULTS_FILE)
+    save_equity_curve(cheap_equity_curve, CHEAP_EQUITY_CURVE_FILE)
+
+    print_summary(regular_trades, "Regular Options Backtest Summary")
+    print_summary(cheap_trades, "$100 Max-Premium Backtest Summary")
+    print(f"\nSaved regular trades to {RESULTS_FILE}")
+    print(f"Saved regular equity curve to {EQUITY_CURVE_FILE}")
+    print(f"Saved $100-max trades to {CHEAP_RESULTS_FILE}")
+    print(f"Saved $100-max equity curve to {CHEAP_EQUITY_CURVE_FILE}")
+
+
+def print_paper_results():
+    from analytics import build_strategy_report
+
+    strategy_names = [strategy["name"] for strategy in PAPER_STRATEGIES]
+    report = build_strategy_report(strategy_names)
+    print("\nLive Paper-Trading Results")
+    print("==========================")
+    print("Source: confirmed Alpaca paper fills in logs/trade_analytics.csv")
+
+    for strategy in strategy_names:
+        stats = report[strategy]
+        completed = stats["completed_trades"]
+        win_rate = stats["wins"] / completed if completed else 0
+        print(f"\n{strategy}")
+        print("-" * len(strategy))
+        print(f"Completed trades: {completed}")
+        print(f"Wins / losses: {stats['wins']} / {stats['losses']}")
+        print(f"Win rate: {win_rate:.2%}")
+        print(f"Realized P/L: ${stats['realized_pnl']:.2f}")
+        print(f"Unrealized P/L: ${stats['unrealized_pnl']:.2f}")
+        print(f"Total P/L: ${stats['realized_pnl'] + stats['unrealized_pnl']:.2f}")
+        print(f"Open positions: {len(stats['open_positions'])}")
+        print(f"Pending orders: {stats['pending_orders']}")
+        for position in sorted(
+            stats["open_positions"], key=lambda item: item["option_symbol"]
+        ):
+            current = position["current_price"]
+            unrealized = position["unrealized_pnl"]
+            current_text = f"${current:.2f}" if current is not None else "n/a"
+            pnl_text = f"${unrealized:.2f}" if unrealized is not None else "n/a"
+            print(
+                f"  {position['option_symbol']}: qty={position['qty']:g}, "
+                f"avg=${position['average_entry_price']:.2f}, "
+                f"current={current_text}, unrealized={pnl_text}"
+            )
 
 
 def parse_args():
@@ -442,10 +503,18 @@ def parse_args():
     )
     parser.add_argument("--period", help="Optional yfinance period override, for example 3y")
     parser.add_argument("--interval", default="1d", help="yfinance interval to backtest. Default: 1d")
+    parser.add_argument(
+        "--paper-results",
+        action="store_true",
+        help="Show live Alpaca paper-fill performance without running a historical backtest.",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    period = args.period or YEARS_TO_PERIOD[args.years]
-    run_backtest(period, args.interval)
+    if args.paper_results:
+        print_paper_results()
+    else:
+        period = args.period or YEARS_TO_PERIOD[args.years]
+        run_backtest(period, args.interval)

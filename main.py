@@ -16,12 +16,13 @@ from config import (
     OPTION_TYPE,
     CONTRACT_QTY,
     MAX_POSITIONS,
+    PAPER_STRATEGIES,
     UNDERLYING_STOP_LOSS_PCT,
     UNDERLYING_TAKE_PROFIT_PCT,
     SCAN_INTERVAL_SECONDS
 )
 
-from analytics import record_event
+from analytics import get_strategy_open_lots, get_submitted_orders, record_event
 from bot_logger import bot_log, setup_logging
 from strategy import (
     is_bullish_setup,
@@ -32,14 +33,14 @@ from strategy import (
 
 from options_trader import (
     trading_client,
-    get_open_positions_count,
-    already_holding_underlying,
     has_earnings_soon,
     get_option_contract,
     manage_underlying_exits,
     buy_option_contract,
     log_open_option_positions,
     log_analytics_summary,
+    reconcile_order_fills,
+    bootstrap_legacy_positions,
 )
 
 
@@ -50,6 +51,8 @@ def run_bot():
     bot_log("Starting options paper trading bot...")
 
     while True:
+        reconcile_order_fills()
+        bootstrap_legacy_positions()
         log_open_option_positions()
         log_analytics_summary()
         manage_underlying_exits(
@@ -88,26 +91,6 @@ def run_bot():
             if not market_regime_ok:
                 continue
 
-            if get_open_positions_count() >= MAX_POSITIONS:
-                open_positions = log_open_option_positions()
-                position_symbols = [position.symbol for position in open_positions]
-                bot_log(
-                    f"Position limit: MAX_POSITIONS={MAX_POSITIONS}, "
-                    f"open_option_positions={len(open_positions)}, symbols={position_symbols}"
-                )
-                bot_log("Max positions reached.")
-                record_event(
-                    "SKIP", underlying=underlying, reason="max_positions",
-                    details=(f"MAX_POSITIONS={MAX_POSITIONS};count={len(open_positions)};"
-                             f"symbols={','.join(position_symbols)}")
-                )
-                break
-
-            if already_holding_underlying(underlying):
-                bot_log(f"Already holding option/position related to {underlying}. Skipping.")
-                record_event("SKIP", underlying=underlying, reason="already_holding")
-                continue
-
             if has_earnings_soon(underlying):
                 continue
 
@@ -133,7 +116,45 @@ def run_bot():
             )
 
             if option_symbol:
-                buy_option_contract(option_symbol, qty=CONTRACT_QTY, underlying=underlying)
+                lots = get_strategy_open_lots()
+                pending = get_submitted_orders().values()
+                for variant in PAPER_STRATEGIES:
+                    strategy_name = variant["name"]
+                    open_count = sum(
+                        1 for strategy, _, _ in lots if strategy == strategy_name
+                    )
+                    pending_buys = sum(
+                        1 for row in pending
+                        if row.get("strategy") == strategy_name
+                        and row.get("order_side") == "buy"
+                    )
+                    if open_count + pending_buys >= MAX_POSITIONS:
+                        bot_log(
+                            f"Strategy position limit reached: strategy={strategy_name} "
+                            f"MAX_POSITIONS={MAX_POSITIONS}"
+                        )
+                        record_event(
+                            "SKIP", strategy=strategy_name, underlying=underlying,
+                            reason="max_positions"
+                        )
+                        continue
+                    already_holds = any(
+                        strategy == strategy_name and lot_underlying == underlying
+                        for strategy, lot_underlying, _ in lots
+                    )
+                    if already_holds:
+                        record_event(
+                            "SKIP", strategy=strategy_name, underlying=underlying,
+                            reason="already_holding"
+                        )
+                        continue
+                    buy_option_contract(
+                        option_symbol,
+                        qty=CONTRACT_QTY,
+                        underlying=underlying,
+                        strategy=strategy_name,
+                        max_entry_premium=variant["max_premium"],
+                    )
 
             time.sleep(2)
 
