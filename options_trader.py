@@ -41,6 +41,7 @@ from config import (
     MAX_TOTAL_OPTION_PREMIUM,
     OPTION_STOP_LOSS_PERCENT,
     OPTION_TRAILING_STOP_PERCENT,
+    PAPER_STRATEGIES,
     require_alpaca_credentials
 )
 from analytics import (
@@ -618,6 +619,7 @@ def buy_option_contract(
             details=(f"order_id={getattr(submitted_order, 'id', '')};"
                      f"underlying_price={underlying_price};estimated_premium={estimated_premium:.2f}")
         )
+        return True
 
     except (APIError, RequestException) as e:
         bot_log(f"Option order failed: {e}")
@@ -629,6 +631,7 @@ def buy_option_contract(
             reason="buy_failed",
             details=str(e)
         )
+        return False
 
 
 def get_option_positions_for_underlying(underlying):
@@ -731,9 +734,20 @@ def manage_underlying_exits(
             continue
 
         current_price = get_underlying_price(underlying)
-        technical_exit, technical_reason = exit_signal_func(underlying)
 
         for (strategy, _, option_symbol), lot in underlying_lots:
+            variant = next(
+                (item for item in PAPER_STRATEGIES if item["name"] == strategy),
+                {
+                    "signal": "daily_trend",
+                    "underlying_stop_loss": stop_loss_pct,
+                    "underlying_take_profit": take_profit_pct,
+                    "max_holding_days": 20,
+                },
+            )
+            technical_exit, technical_reason = exit_signal_func(
+                underlying, variant["signal"]
+            )
             position = positions_by_symbol.get(option_symbol)
             if position is None:
                 continue
@@ -744,6 +758,22 @@ def manage_underlying_exits(
             option_price = _to_float(getattr(position, "current_price", None)) or 0
             option_entry = lot["cost"] / lot["qty"] if lot["qty"] else 0
             option_plpc = (option_price - option_entry) / option_entry if option_entry else 0
+            opened_at = lot.get("opened_at", "")
+            held_weekdays = 0
+            if opened_at:
+                try:
+                    opened_date = datetime.fromisoformat(
+                        opened_at.replace("Z", "+00:00")
+                    ).date()
+                    cursor = opened_date
+                    while cursor < date.today():
+                        cursor += timedelta(days=1)
+                        if cursor.weekday() < 5:
+                            held_weekdays += 1
+                except ValueError:
+                    bot_log(
+                        f"Could not parse entry timestamp for {option_symbol}: {opened_at}"
+                    )
             high_water_key = (strategy, option_symbol)
             high_water = max(_high_water_marks.get(high_water_key, option_price), option_price)
             _high_water_marks[high_water_key] = high_water
@@ -752,6 +782,8 @@ def manage_underlying_exits(
                 exit_reason = f"expiration_management_dte_{dte}"
             elif option_plpc <= -OPTION_STOP_LOSS_PERCENT:
                 exit_reason = f"option_stop_loss_{option_plpc:.2%}"
+            elif held_weekdays >= variant["max_holding_days"]:
+                exit_reason = f"max_holding_days_{held_weekdays}"
             elif (
                 OPTION_TRAILING_STOP_PERCENT > 0
                 and high_water > 0
@@ -763,9 +795,9 @@ def manage_underlying_exits(
             if current_price and entry_price:
                 change_pct = (current_price - entry_price) / entry_price
 
-                if change_pct <= -stop_loss_pct:
+                if change_pct <= -variant["underlying_stop_loss"]:
                     exit_reason = f"underlying_stop_loss_{change_pct:.2%}"
-                elif change_pct >= take_profit_pct:
+                elif change_pct >= variant["underlying_take_profit"]:
                     exit_reason = f"underlying_take_profit_{change_pct:.2%}"
 
             if exit_reason:

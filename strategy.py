@@ -1,8 +1,14 @@
 import yfinance as yf
 import ta
+from datetime import date
+from time import monotonic
 from requests.exceptions import RequestException
 
 from bot_logger import bot_log
+
+
+_daily_close_cache = {}
+_DAILY_CLOSE_CACHE_SECONDS = 240
 
 
 def wait_for_market_open(trading_client):
@@ -24,44 +30,96 @@ def wait_for_market_open(trading_client):
         time.sleep(60)
 
 
-def is_bullish_setup(symbol, ma_short, ma_long, macd_fast, macd_slow, macd_signal):
+def _completed_daily_close(symbol):
+    cached = _daily_close_cache.get(symbol)
+    if cached and monotonic() - cached[0] < _DAILY_CLOSE_CACHE_SECONDS:
+        return cached[1]
+    data = yf.download(symbol, period="3y", interval="1d", progress=False)
+    if data is None or data.empty:
+        return None
+    close = data["Close"].squeeze().dropna()
+    if not close.empty and close.index[-1].date() >= date.today():
+        close = close.iloc[:-1]
+    result = close if not close.empty else None
+    _daily_close_cache[symbol] = (monotonic(), result)
+    return result
+
+
+def _daily_indicators(close, ma_short, ma_long, macd_fast, macd_slow, macd_signal):
+    macd = ta.trend.MACD(
+        close=close,
+        window_fast=macd_fast,
+        window_slow=macd_slow,
+        window_sign=macd_signal,
+    )
+    return {
+        "ma_short": close.rolling(ma_short).mean(),
+        "ma_long": close.rolling(ma_long).mean(),
+        "ema_10": close.ewm(span=10, adjust=False).mean(),
+        "ema_20": close.ewm(span=20, adjust=False).mean(),
+        "rsi": ta.momentum.RSIIndicator(close, window=14).rsi(),
+        "macd": macd.macd(),
+        "macd_signal": macd.macd_signal(),
+        "macd_hist": macd.macd_diff(),
+    }
+
+
+def is_bullish_setup(
+    symbol, ma_short, ma_long, macd_fast, macd_slow, macd_signal,
+    signal="daily_trend",
+):
     try:
-        data = yf.download(symbol, period="1y", interval="1h", progress=False)
-
-        if data is None or data.empty:
+        close = _completed_daily_close(symbol)
+        if close is None:
             return False
-
-        close = data["Close"].squeeze()
 
         if len(close) < ma_long + 5:
             return False
 
-        ma_short_series = close.rolling(ma_short).mean()
-        ma_long_series = close.rolling(ma_long).mean()
-
-        macd = ta.trend.MACD(
-            close=close,
-            window_fast=macd_fast,
-            window_slow=macd_slow,
-            window_sign=macd_signal
+        indicators = _daily_indicators(
+            close, ma_short, ma_long, macd_fast, macd_slow, macd_signal
         )
 
         latest_close = float(close.iloc[-1])
-        latest_ma_short = float(ma_short_series.iloc[-1])
-        prev_ma_short = float(ma_short_series.iloc[-2])
-        latest_ma_long = float(ma_long_series.iloc[-1])
-
-        latest_macd = float(macd.macd().iloc[-1])
-        latest_macd_signal = float(macd.macd_signal().iloc[-1])
-        latest_macd_hist = float(macd.macd_diff().iloc[-1])
+        latest_ma_short = float(indicators["ma_short"].iloc[-1])
+        prev_ma_short = float(indicators["ma_short"].iloc[-2])
+        latest_ma_long = float(indicators["ma_long"].iloc[-1])
+        latest_macd = float(indicators["macd"].iloc[-1])
+        latest_macd_signal = float(indicators["macd_signal"].iloc[-1])
+        latest_macd_hist = float(indicators["macd_hist"].iloc[-1])
 
         in_uptrend = latest_close > latest_ma_short > latest_ma_long
         ma_rising = latest_ma_short > prev_ma_short
         macd_confirmed = latest_macd > latest_macd_signal and latest_macd_hist > 0
 
-        bot_log(f"{symbol}: close={latest_close:.2f}, MA50={latest_ma_short:.2f}, MA200={latest_ma_long:.2f}, MACD hist={latest_macd_hist:.4f}")
+        if signal == "daily_swing":
+            previous_close = float(close.iloc[-2])
+            ema_10 = float(indicators["ema_10"].iloc[-1])
+            ema_20 = float(indicators["ema_20"].iloc[-1])
+            previous_ema_20 = float(indicators["ema_20"].iloc[-2])
+            rsi = float(indicators["rsi"].iloc[-1])
+            bullish = (
+                latest_close > latest_ma_long
+                and latest_ma_short > latest_ma_long
+                and previous_close <= previous_ema_20
+                and latest_close > ema_20
+                and latest_close > ema_10
+                and 45 <= rsi <= 65
+                and latest_macd_hist > 0
+            )
+            bot_log(
+                f"{symbol} daily_swing: close={latest_close:.2f}, EMA20={ema_20:.2f}, "
+                f"RSI={rsi:.2f}, MACD hist={latest_macd_hist:.4f}, bullish={bullish}"
+            )
+            return bullish
 
-        return in_uptrend and ma_rising and macd_confirmed
+        bullish = in_uptrend and ma_rising and macd_confirmed
+        bot_log(
+            f"{symbol} daily_trend: close={latest_close:.2f}, "
+            f"MA50={latest_ma_short:.2f}, MA200={latest_ma_long:.2f}, "
+            f"MACD hist={latest_macd_hist:.4f}, bullish={bullish}"
+        )
+        return bullish
 
     except Exception as e:
         bot_log(f"Strategy error for {symbol}: {e}")
@@ -70,12 +128,9 @@ def is_bullish_setup(symbol, ma_short, ma_long, macd_fast, macd_slow, macd_signa
 
 def is_market_regime_bullish(symbol, short_ma, long_ma):
     try:
-        data = yf.download(symbol, period="2y", interval="1d", progress=False)
-
-        if data is None or data.empty:
+        close = _completed_daily_close(symbol)
+        if close is None:
             return False
-
-        close = data["Close"].squeeze()
 
         if len(close) < long_ma + 5:
             return False
@@ -101,32 +156,32 @@ def is_market_regime_bullish(symbol, short_ma, long_ma):
         return False
 
 
-def is_underlying_exit_signal(symbol, ma_short, ma_long, macd_fast, macd_slow, macd_signal):
+def is_underlying_exit_signal(
+    symbol, ma_short, ma_long, macd_fast, macd_slow, macd_signal,
+    signal="daily_trend",
+):
     try:
-        data = yf.download(symbol, period="1y", interval="1h", progress=False)
-
-        if data is None or data.empty:
+        close = _completed_daily_close(symbol)
+        if close is None:
             return False, "no_data"
-
-        close = data["Close"].squeeze()
 
         if len(close) < ma_long + 5:
             return False, "not_enough_data"
 
-        ma_short_series = close.rolling(ma_short).mean()
-        ma_long_series = close.rolling(ma_long).mean()
-
-        macd = ta.trend.MACD(
-            close=close,
-            window_fast=macd_fast,
-            window_slow=macd_slow,
-            window_sign=macd_signal
+        indicators = _daily_indicators(
+            close, ma_short, ma_long, macd_fast, macd_slow, macd_signal
         )
 
         latest_close = float(close.iloc[-1])
-        latest_ma_short = float(ma_short_series.iloc[-1])
-        latest_ma_long = float(ma_long_series.iloc[-1])
-        latest_macd_hist = float(macd.macd_diff().iloc[-1])
+        latest_ma_short = float(indicators["ma_short"].iloc[-1])
+        latest_ma_long = float(indicators["ma_long"].iloc[-1])
+        latest_macd_hist = float(indicators["macd_hist"].iloc[-1])
+
+        if signal == "daily_swing":
+            latest_ema_20 = float(indicators["ema_20"].iloc[-1])
+            if latest_close < latest_ema_20:
+                return True, "close_below_ema_20"
+            return False, ""
 
         if latest_close < latest_ma_long:
             return True, "close_below_long_ma"

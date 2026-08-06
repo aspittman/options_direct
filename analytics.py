@@ -104,10 +104,14 @@ def get_strategy_open_lots():
         if not strategy or not symbol:
             continue
         key = (strategy, row.get("underlying", ""), symbol)
-        bucket = lots.setdefault(key, {"qty": 0.0, "cost": 0.0, "underlying_cost": 0.0})
+        bucket = lots.setdefault(key, {
+            "qty": 0.0, "cost": 0.0, "underlying_cost": 0.0, "opened_at": ""
+        })
         qty = float(row.get("qty") or 0)
         price = float(row.get("price") or 0)
         if row.get("order_side") == "buy":
+            if bucket["qty"] <= 0:
+                bucket["opened_at"] = row.get("timestamp", "")
             bucket["cost"] += qty * price
             bucket["underlying_cost"] += qty * float(row.get("underlying_price") or 0)
             bucket["qty"] += qty
@@ -118,6 +122,8 @@ def get_strategy_open_lots():
             bucket["qty"] -= closed_qty
             bucket["cost"] -= closed_qty * average
             bucket["underlying_cost"] -= closed_qty * underlying_average
+            if bucket["qty"] <= 0:
+                bucket["opened_at"] = ""
     return {key: value for key, value in lots.items() if value["qty"] > 0}
 
 

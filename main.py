@@ -16,6 +16,9 @@ from config import (
     OPTION_TYPE,
     CONTRACT_QTY,
     MAX_POSITIONS,
+    MAX_POSITIONS_PER_CORRELATION_GROUP,
+    correlation_group,
+    ENABLE_NEW_ENTRIES,
     PAPER_STRATEGIES,
     UNDERLYING_STOP_LOSS_PCT,
     UNDERLYING_TAKE_PROFIT_PCT,
@@ -49,6 +52,8 @@ def run_bot():
     wait_for_market_open(trading_client)
 
     bot_log("Starting options paper trading bot...")
+    if not ENABLE_NEW_ENTRIES:
+        bot_log("New entries are disabled; existing positions will still be managed.")
 
     while True:
         reconcile_order_fills()
@@ -57,17 +62,23 @@ def run_bot():
         log_analytics_summary()
         manage_underlying_exits(
             UNDERLYINGS,
-            lambda symbol: is_underlying_exit_signal(
+            lambda symbol, signal: is_underlying_exit_signal(
                 symbol,
                 MA_SHORT,
                 MA_LONG,
                 MACD_FAST,
                 MACD_SLOW,
-                MACD_SIGNAL
+                MACD_SIGNAL,
+                signal=signal,
             ),
             UNDERLYING_STOP_LOSS_PCT,
             UNDERLYING_TAKE_PROFIT_PCT
         )
+
+        if not ENABLE_NEW_ENTRIES:
+            record_event("SKIP", reason="new_entries_disabled")
+            time.sleep(SCAN_INTERVAL_SECONDS)
+            continue
 
         market_regime_ok = True
         if ENABLE_MARKET_REGIME_FILTER:
@@ -94,18 +105,27 @@ def run_bot():
             if has_earnings_soon(underlying):
                 continue
 
-            bullish = is_bullish_setup(
-                underlying,
-                MA_SHORT,
-                MA_LONG,
-                MACD_FAST,
-                MACD_SLOW,
-                MACD_SIGNAL
-            )
+            eligible_variants = []
+            for variant in PAPER_STRATEGIES:
+                bullish = is_bullish_setup(
+                    underlying,
+                    MA_SHORT,
+                    MA_LONG,
+                    MACD_FAST,
+                    MACD_SLOW,
+                    MACD_SIGNAL,
+                    signal=variant["signal"],
+                )
+                if bullish:
+                    eligible_variants.append(variant)
+                else:
+                    record_event(
+                        "SKIP", strategy=variant["name"], underlying=underlying,
+                        reason=f"not_bullish_{variant['signal']}"
+                    )
 
-            if not bullish:
-                bot_log(f"No bullish setup for {underlying}.")
-                record_event("SKIP", underlying=underlying, reason="not_bullish")
+            if not eligible_variants:
+                bot_log(f"No daily bullish setup for {underlying}.")
                 continue
 
             option_symbol = get_option_contract(
@@ -118,24 +138,38 @@ def run_bot():
             if option_symbol:
                 lots = get_strategy_open_lots()
                 pending = get_submitted_orders().values()
-                for variant in PAPER_STRATEGIES:
+                reserved_count = len(lots) + sum(
+                    1 for row in pending if row.get("order_side") == "buy"
+                )
+                reserved_group_counts = {}
+                for _, lot_underlying, _ in lots:
+                    group = correlation_group(lot_underlying)
+                    reserved_group_counts[group] = reserved_group_counts.get(group, 0) + 1
+                for row in pending:
+                    if row.get("order_side") == "buy":
+                        group = correlation_group(row.get("underlying", ""))
+                        reserved_group_counts[group] = reserved_group_counts.get(group, 0) + 1
+                for variant in eligible_variants:
                     strategy_name = variant["name"]
-                    open_count = sum(
-                        1 for strategy, _, _ in lots if strategy == strategy_name
-                    )
-                    pending_buys = sum(
-                        1 for row in pending
-                        if row.get("strategy") == strategy_name
-                        and row.get("order_side") == "buy"
-                    )
-                    if open_count + pending_buys >= MAX_POSITIONS:
+                    if reserved_count >= MAX_POSITIONS:
                         bot_log(
-                            f"Strategy position limit reached: strategy={strategy_name} "
+                            f"Global position limit reached: strategy={strategy_name} "
                             f"MAX_POSITIONS={MAX_POSITIONS}"
                         )
                         record_event(
                             "SKIP", strategy=strategy_name, underlying=underlying,
                             reason="max_positions"
+                        )
+                        continue
+                    target_group = correlation_group(underlying)
+                    if reserved_group_counts.get(target_group, 0) >= MAX_POSITIONS_PER_CORRELATION_GROUP:
+                        bot_log(
+                            f"Correlation-group limit reached: group={target_group} "
+                            f"underlying={underlying}"
+                        )
+                        record_event(
+                            "SKIP", strategy=strategy_name, underlying=underlying,
+                            reason=f"correlation_group_{target_group}"
                         )
                         continue
                     already_holds = any(
@@ -148,13 +182,18 @@ def run_bot():
                             reason="already_holding"
                         )
                         continue
-                    buy_option_contract(
+                    submitted = buy_option_contract(
                         option_symbol,
                         qty=CONTRACT_QTY,
                         underlying=underlying,
                         strategy=strategy_name,
                         max_entry_premium=variant["max_premium"],
                     )
+                    if submitted:
+                        reserved_count += 1
+                        reserved_group_counts[target_group] = (
+                            reserved_group_counts.get(target_group, 0) + 1
+                        )
 
             time.sleep(2)
 

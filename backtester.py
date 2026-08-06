@@ -9,6 +9,7 @@ import yfinance as yf
 from config import (
     BACKTEST_ENTRY_DTE,
     BACKTEST_OPTION_TIME_VALUE_PERCENT,
+    BACKTEST_STARTING_CASH,
     MACD_FAST,
     MACD_SIGNAL,
     MACD_SLOW,
@@ -20,6 +21,11 @@ from config import (
     TARGET_DELTA,
     UNDERLYINGS,
     PAPER_STRATEGIES,
+    MAX_POSITIONS,
+    MAX_TOTAL_OPTION_PREMIUM,
+    REGULAR_MAX_PREMIUM_PER_TRADE,
+    MAX_POSITIONS_PER_CORRELATION_GROUP,
+    correlation_group,
 )
 
 
@@ -50,6 +56,62 @@ FIELDNAMES = [
 ]
 
 EQUITY_FIELDNAMES = ["date", "trade_number", "pnl_dollars", "equity", "drawdown"]
+SWING_MAX_HOLDING_DAYS = 15
+SWING_STOP_LOSS_PERCENT = 0.03
+SWING_TAKE_PROFIT_PERCENT = 0.06
+
+
+def apply_portfolio_constraints(
+    trades,
+    starting_cash=BACKTEST_STARTING_CASH,
+    max_positions=MAX_POSITIONS,
+    max_total_premium=MAX_TOTAL_OPTION_PREMIUM,
+    max_entry_premium=None,
+    max_positions_per_group=MAX_POSITIONS_PER_CORRELATION_GROUP,
+):
+    """Select affordable trades chronologically and enforce portfolio exposure.
+
+    Entry and exit prices are still estimates, but this prevents the backtest from
+    spending cash it does not have or opening more positions than the live bot.
+    Candidates with the same entry date are selected deterministically by symbol.
+    """
+    cash = float(starting_cash)
+    active = []
+    selected = []
+
+    for trade in sorted(trades, key=lambda item: (item["entry_date"], item["symbol"])):
+        entry_date = trade["entry_date"]
+        still_active = []
+        for position in active:
+            if position["exit_date"] < entry_date:
+                cash += float(position["estimated_option_exit_price"]) * CONTRACT_MULTIPLIER
+            else:
+                still_active.append(position)
+        active = still_active
+
+        premium = float(trade["estimated_option_entry_price"]) * CONTRACT_MULTIPLIER
+        deployed = sum(
+            float(position["estimated_option_entry_price"]) * CONTRACT_MULTIPLIER
+            for position in active
+        )
+        if max_entry_premium is not None and premium > max_entry_premium:
+            continue
+        if len(active) >= max_positions:
+            continue
+        group_count = sum(
+            1 for position in active
+            if correlation_group(position["symbol"]) == correlation_group(trade["symbol"])
+        )
+        if group_count >= max_positions_per_group:
+            continue
+        if premium > cash or deployed + premium > max_total_premium:
+            continue
+
+        cash -= premium
+        active.append(trade)
+        selected.append(trade)
+
+    return selected
 
 
 def get_close_series(symbol, period, interval):
@@ -85,6 +147,145 @@ def build_signals(close):
         "macd_hist": macd.macd_diff(),
     }
     return indicators
+
+
+def build_swing_signals(close):
+    """Daily trend/pullback indicators for the experimental swing strategy."""
+    macd = ta.trend.MACD(
+        close=close,
+        window_fast=MACD_FAST,
+        window_slow=MACD_SLOW,
+        window_sign=MACD_SIGNAL,
+    )
+    return {
+        "ema_10": close.ewm(span=10, adjust=False).mean(),
+        "ema_20": close.ewm(span=20, adjust=False).mean(),
+        "ma_50": close.rolling(50).mean(),
+        "ma_200": close.rolling(200).mean(),
+        "rsi": ta.momentum.RSIIndicator(close, window=14).rsi(),
+        "macd_hist": macd.macd_diff(),
+    }
+
+
+def is_swing_entry_at(close, indicators, index):
+    if index <= 0:
+        return False
+    values = [
+        close.iloc[index],
+        close.iloc[index - 1],
+        indicators["ema_10"].iloc[index],
+        indicators["ema_20"].iloc[index],
+        indicators["ema_20"].iloc[index - 1],
+        indicators["ma_50"].iloc[index],
+        indicators["ma_200"].iloc[index],
+        indicators["rsi"].iloc[index],
+        indicators["macd_hist"].iloc[index],
+    ]
+    if any(value != value for value in values):
+        return False
+
+    latest, previous, ema_10, ema_20, previous_ema_20, ma_50, ma_200, rsi, macd_hist = values
+    bullish_regime = latest > ma_200 and ma_50 > ma_200
+    pullback_reclaimed = previous <= previous_ema_20 and latest > ema_20
+    confirmation = latest > ema_10 and 45 <= rsi <= 65 and macd_hist > 0
+    return bullish_regime and pullback_reclaimed and confirmation
+
+
+def backtest_underlying_signal(symbol, close, strategy):
+    """Evaluate signal expectancy without depending on synthetic option prices."""
+    minimum_bars = 205
+    if len(close) < minimum_bars:
+        return []
+    current_indicators = build_signals(close)
+    swing_indicators = build_swing_signals(close)
+    trades = []
+    entry_index = None
+
+    for index in range(minimum_bars, len(close)):
+        if entry_index is None:
+            enters = (
+                is_bullish_at(close, current_indicators, index)
+                if strategy == "current"
+                else is_swing_entry_at(close, swing_indicators, index)
+            )
+            if enters:
+                entry_index = index
+            continue
+
+        entry_price = float(close.iloc[entry_index])
+        exit_price = float(close.iloc[index])
+        return_pct = (exit_price - entry_price) / entry_price
+        reason = ""
+        if strategy == "swing":
+            if return_pct <= -SWING_STOP_LOSS_PERCENT:
+                reason = "underlying_stop_loss"
+            elif return_pct >= SWING_TAKE_PROFIT_PERCENT:
+                reason = "underlying_take_profit"
+            elif index - entry_index >= SWING_MAX_HOLDING_DAYS:
+                reason = "max_holding_days"
+            elif exit_price < float(swing_indicators["ema_20"].iloc[index]):
+                reason = "close_below_ema_20"
+        else:
+            if index - entry_index >= MAX_HOLDING_DAYS:
+                reason = "max_holding_days"
+            else:
+                reason = bearish_exit_reason(close, current_indicators, index)
+
+        if reason:
+            trades.append({
+                "symbol": symbol,
+                "entry_date": close.index[entry_index].date().isoformat(),
+                "exit_date": close.index[index].date().isoformat(),
+                "pnl_dollars": round(return_pct * 100, 2),
+                "pnl_percent": round(return_pct * 100, 2),
+                "entry_underlying_price": round(entry_price, 2),
+                "exit_underlying_price": round(exit_price, 2),
+                "exit_reason": reason,
+            })
+            entry_index = None
+
+    return trades
+
+
+def run_signal_comparison(period, interval):
+    results = {"current": [], "swing": []}
+    for symbol in UNDERLYINGS:
+        close = get_close_series(symbol, period, interval)
+        if close is None:
+            continue
+        for strategy in results:
+            results[strategy].extend(backtest_underlying_signal(symbol, close, strategy))
+
+    print("\nSignal comparison (P/L per $100 of underlying exposure)")
+    print("=====================================================")
+    print("This evaluates entries and exits, not option pricing or fills.")
+    print_summary(results["current"], "Current MA/MACD Signal")
+    print_summary(results["swing"], "Experimental Daily Pullback Swing Signal")
+    return results
+
+
+def run_alpaca_option_backtest(period, interval, strategy, max_candidates):
+    if interval != "1d":
+        raise ValueError("Alpaca option validation requires --interval 1d")
+    from alpaca_option_backtest import reprice_candidates
+
+    candidates = []
+    for symbol in UNDERLYINGS:
+        close = get_close_series(symbol, period, interval)
+        if close is not None:
+            candidates.extend(backtest_underlying_signal(symbol, close, strategy))
+    candidates.sort(key=lambda item: (item["entry_date"], item["symbol"]))
+    trades = reprice_candidates(
+        candidates,
+        max_entry_premium=100.0,
+        max_candidates=max_candidates,
+    )
+    trades = apply_portfolio_constraints(
+        trades,
+        max_entry_premium=100.0,
+    )
+    print_summary(trades, f"Alpaca Historical Options: {strategy}")
+    return trades
 
 
 def is_bullish_at(close, indicators, index):
@@ -249,20 +450,27 @@ def build_trade(symbol, close, entry_index, exit_index, exit_reason, option_posi
     }
 
 
-def backtest_close(symbol, close, max_entry_premium=None):
+def backtest_close(symbol, close, max_entry_premium=None, strategy="current"):
     minimum_bars = max(MA_LONG, MACD_SLOW + MACD_SIGNAL) + 5
     if len(close) < minimum_bars:
         print(f"{symbol}: not enough historical data ({len(close)} bars)")
         return []
 
-    indicators = build_signals(close)
+    indicators = (
+        build_swing_signals(close) if strategy == "swing" else build_signals(close)
+    )
     trades = []
     entry_index = None
     option_position = None
 
     for index in range(minimum_bars, len(close)):
         if entry_index is None:
-            if is_bullish_at(close, indicators, index):
+            enters = (
+                is_swing_entry_at(close, indicators, index)
+                if strategy == "swing"
+                else is_bullish_at(close, indicators, index)
+            )
+            if enters:
                 candidate = build_option_position(float(close.iloc[index]))
                 entry_premium = candidate["entry_price"] * CONTRACT_MULTIPLIER
                 if max_entry_premium is None or entry_premium <= max_entry_premium:
@@ -280,14 +488,30 @@ def backtest_close(symbol, close, max_entry_premium=None):
         option_pnl_pct = (option_exit_price - option_entry_price) / option_entry_price
 
         exit_reason = ""
+        underlying_return = (
+            float(close.iloc[index]) - float(close.iloc[entry_index])
+        ) / float(close.iloc[entry_index])
         if option_pnl_pct <= -OPTION_STOP_LOSS_PERCENT:
             exit_reason = "option_stop_loss"
         elif option_pnl_pct >= OPTION_TAKE_PROFIT_PERCENT:
             exit_reason = "option_take_profit"
-        elif index - entry_index >= MAX_HOLDING_DAYS:
+        elif strategy == "swing" and underlying_return <= -SWING_STOP_LOSS_PERCENT:
+            exit_reason = "underlying_stop_loss"
+        elif strategy == "swing" and underlying_return >= SWING_TAKE_PROFIT_PERCENT:
+            exit_reason = "underlying_take_profit"
+        elif index - entry_index >= (
+            SWING_MAX_HOLDING_DAYS if strategy == "swing" else MAX_HOLDING_DAYS
+        ):
             exit_reason = "max_holding_days"
+        elif strategy == "swing" and float(close.iloc[index]) < float(
+            indicators["ema_20"].iloc[index]
+        ):
+            exit_reason = "close_below_ema_20"
         else:
-            exit_reason = bearish_exit_reason(close, indicators, index)
+            exit_reason = (
+                "" if strategy == "swing"
+                else bearish_exit_reason(close, indicators, index)
+            )
 
         if exit_reason:
             trades.append(build_trade(
@@ -314,13 +538,13 @@ def backtest_close(symbol, close, max_entry_premium=None):
     return trades
 
 
-def backtest_symbol(symbol, period, interval, max_entry_premium=None):
+def backtest_symbol(symbol, period, interval, max_entry_premium=None, strategy="current"):
     close = get_close_series(symbol, period, interval)
     if close is None:
         print(f"{symbol}: no historical data")
         return []
 
-    return backtest_close(symbol, close, max_entry_premium)
+    return backtest_close(symbol, close, max_entry_premium, strategy)
 
 
 def save_trades(trades, results_file=RESULTS_FILE):
@@ -438,8 +662,18 @@ def run_backtest(period, interval):
             print(f"{symbol}: no historical data")
             continue
         regular_trades.extend(backtest_close(symbol, close))
-        cheap_trades.extend(backtest_close(symbol, close, CHEAP_MAX_PREMIUM))
+        cheap_trades.extend(backtest_close(
+            symbol, close, CHEAP_MAX_PREMIUM, strategy="swing"
+        ))
 
+    regular_trades = apply_portfolio_constraints(
+        regular_trades,
+        max_entry_premium=REGULAR_MAX_PREMIUM_PER_TRADE,
+    )
+    cheap_trades = apply_portfolio_constraints(
+        cheap_trades,
+        max_entry_premium=CHEAP_MAX_PREMIUM,
+    )
     regular_equity_curve = build_equity_curve(regular_trades)
     cheap_equity_curve = build_equity_curve(cheap_trades)
     save_trades(regular_trades, RESULTS_FILE)
@@ -448,7 +682,7 @@ def run_backtest(period, interval):
     save_equity_curve(cheap_equity_curve, CHEAP_EQUITY_CURVE_FILE)
 
     print_summary(regular_trades, "Regular Options Backtest Summary")
-    print_summary(cheap_trades, "$100 Max-Premium Backtest Summary")
+    print_summary(cheap_trades, "$100 Daily Swing Backtest Summary")
     print(f"\nSaved regular trades to {RESULTS_FILE}")
     print(f"Saved regular equity curve to {EQUITY_CURVE_FILE}")
     print(f"Saved $100-max trades to {CHEAP_RESULTS_FILE}")
@@ -508,6 +742,22 @@ def parse_args():
         action="store_true",
         help="Show live Alpaca paper-fill performance without running a historical backtest.",
     )
+    parser.add_argument(
+        "--compare-signals",
+        action="store_true",
+        help="Compare current and experimental swing signals without synthetic option prices.",
+    )
+    parser.add_argument(
+        "--alpaca-options",
+        choices=("current", "swing"),
+        help="Validate one signal using actual Alpaca historical daily option bars.",
+    )
+    parser.add_argument(
+        "--max-candidates",
+        type=int,
+        default=100,
+        help="Maximum recent candidates to query in --alpaca-options mode. Default: 100.",
+    )
     return parser.parse_args()
 
 
@@ -515,6 +765,14 @@ if __name__ == "__main__":
     args = parse_args()
     if args.paper_results:
         print_paper_results()
+    elif args.alpaca_options:
+        period = args.period or YEARS_TO_PERIOD[args.years]
+        run_alpaca_option_backtest(
+            period, args.interval, args.alpaca_options, args.max_candidates
+        )
+    elif args.compare_signals:
+        period = args.period or YEARS_TO_PERIOD[args.years]
+        run_signal_comparison(period, args.interval)
     else:
         period = args.period or YEARS_TO_PERIOD[args.years]
         run_backtest(period, args.interval)

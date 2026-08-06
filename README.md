@@ -31,17 +31,25 @@ python main.py
 Optional option-risk settings (shown with defaults):
 
 ```bash
-EXIT_DTE=7
-OPTION_STOP_LOSS_PERCENT=0.50
+ENABLE_NEW_ENTRIES=false
+EXIT_DTE=30
+OPTION_STOP_LOSS_PERCENT=0.30
 OPTION_TRAILING_STOP_PERCENT=0.25
 MAX_PREMIUM_PER_TRADE=100
-REGULAR_MAX_PREMIUM_PER_TRADE=0
+REGULAR_MAX_PREMIUM_PER_TRADE=100
 MAX_100_PREMIUM_PER_TRADE=100
-MAX_TOTAL_OPTION_PREMIUM=500
+MAX_TOTAL_OPTION_PREMIUM=200
 MAX_POSITIONS=2
+MAX_POSITIONS_PER_CORRELATION_GROUP=1
+BACKTEST_STARTING_CASH=2500
 ALLOW_DUPLICATE_CONTRACTS=false
 ALLOW_MULTIPLE_CONTRACTS_PER_UNDERLYING=false
 ```
+
+When `ENABLE_NEW_ENTRIES=false`, the bot continues reconciling fills and managing
+all existing exits, but it submits no new buy orders. Set it to `true` only when
+you intentionally resume paper entries. `MAX_POSITIONS=2` is enforced globally
+across both named strategies, and the total-premium limit is also shared.
 
 Percent settings are decimal fractions. Position limits and premium totals apply
 only to option contracts submitted by OptionsDirect; stock positions and other
@@ -49,13 +57,24 @@ bots' positions are excluded. The analytics CSV records realized and unrealized
 P/L in separate columns and the cycle log reports results both by contract and
 by underlying.
 
-The live paper bot runs two named variants in the same Alpaca paper account:
+The live paper bot runs two named daily variants in the same Alpaca paper account.
+Both use completed daily candles and 60–90 DTE calls, so the live and historical
+indicator periods now represent the same timeframe:
 
-- `regular` uses the normal strategy. Its per-trade premium limit defaults to
-  `0`, meaning no per-trade cap (the account-wide total-premium guard still
-  applies).
-- `max_100` uses the same signal, contract selection, and exit rules, but rejects
-  entries whose estimated one-contract premium exceeds $100.
+- `regular` is the daily trend control: price above rising 50/200-day averages
+  with positive MACD confirmation. It holds for at most 20 trading days.
+- `max_100` is the daily pullback-swing candidate: bullish 50/200-day regime,
+  20-day EMA reclaim, 10-day EMA confirmation, RSI 45–65, and positive MACD
+  histogram. It uses a 3% underlying stop, 6% target, and 15-day maximum hold.
+
+Both variants cap entry premium at $100. Across the two variants, at most two
+positions and $200 of entry premium may be open. All contracts are closed by 30
+DTE, and the 30% option stop is catastrophe protection in addition to the
+underlying and technical exits.
+Only one open or pending position is allowed from each configured correlation
+group (broad indexes, technology, financials, energy, healthcare, and
+consumer/industrial), preventing both slots from expressing essentially the same
+sector bet.
 
 Both variants submit separately tagged paper orders. Alpaca combines quantities
 when both variants own the same contract, while `logs/trade_analytics.csv` keeps
@@ -70,18 +89,33 @@ Run the options backtester:
 python backtester.py --years 1
 python backtester.py --years 3
 python backtester.py --years 5
+python backtester.py --years 5 --compare-signals
+python backtester.py --years 2 --alpaca-options swing --max-candidates 100
 ```
 
-Each run prints two summaries: the regular one-contract simulation and a second
-simulation that only enters contracts costing $100 or less. The regular results
+`--compare-signals` compares the existing MA/MACD rules with an experimental
+daily pullback swing setup using $100 of underlying exposure per trade. This
+isolates entry/exit quality from synthetic option pricing; it is not an option
+return simulation and does not authorize changing the live strategy by itself.
+
+`--alpaca-options` uses actual Alpaca daily option bars and expired contract
+metadata instead of theoretical option prices. Alpaca option history begins in
+February 2024. Candidates without a real entry/exit bar or a qualifying contract
+under the premium ceiling are skipped; the command never fabricates a fill.
+
+Each standard run prints two summaries: the daily trend control and the daily
+swing variant, both subject to their configured premium limits. The trend results
 are written to `logs/options_backtest_trades.csv` and
-`logs/options_backtest_equity_curve.csv`; the $100-max results are written to
+`logs/options_backtest_equity_curve.csv`; the daily-swing results are written to
 `logs/options_backtest_trades_100_max.csv` and
 `logs/options_backtest_equity_curve_100_max.csv`. Each summary includes win rate,
 total P/L, profit factor, expectancy, maximum drawdown, and symbol-level results.
 Historical backtests remain separate from live paper analytics: they provide many
 years of fast, estimated testing, while the live analytics file measures the
 actual fills returned by Alpaca paper trading from this point forward.
+Both historical variants now enforce starting cash, the configured maximum of two
+concurrent positions, the shared total-premium ceiling, and their per-trade premium
+limits. Option prices remain estimates rather than historical option-chain quotes.
 
 View both live paper strategies without placing orders or running a historical
 simulation:
