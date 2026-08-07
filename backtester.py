@@ -24,6 +24,7 @@ from config import (
     MAX_POSITIONS,
     MAX_TOTAL_OPTION_PREMIUM,
     REGULAR_MAX_PREMIUM_PER_TRADE,
+    MAX_100_PREMIUM_PER_TRADE,
     MAX_POSITIONS_PER_CORRELATION_GROUP,
     correlation_group,
 )
@@ -34,7 +35,7 @@ EQUITY_CURVE_FILE = Path("logs/options_backtest_equity_curve.csv")
 CHEAP_RESULTS_FILE = Path("logs/options_backtest_trades_100_max.csv")
 CHEAP_EQUITY_CURVE_FILE = Path("logs/options_backtest_equity_curve_100_max.csv")
 CONTRACT_MULTIPLIER = 100
-CHEAP_MAX_PREMIUM = 100.0
+CHEAP_MAX_PREMIUM = MAX_100_PREMIUM_PER_TRADE
 YEARS_TO_PERIOD = {1: "1y", 3: "3y", 5: "5y"}
 
 FIELDNAMES = [
@@ -682,11 +683,11 @@ def run_backtest(period, interval):
     save_equity_curve(cheap_equity_curve, CHEAP_EQUITY_CURVE_FILE)
 
     print_summary(regular_trades, "Regular Options Backtest Summary")
-    print_summary(cheap_trades, "$100 Daily Swing Backtest Summary")
+    print_summary(cheap_trades, f"${CHEAP_MAX_PREMIUM:g} Daily Swing Backtest Summary")
     print(f"\nSaved regular trades to {RESULTS_FILE}")
     print(f"Saved regular equity curve to {EQUITY_CURVE_FILE}")
-    print(f"Saved $100-max trades to {CHEAP_RESULTS_FILE}")
-    print(f"Saved $100-max equity curve to {CHEAP_EQUITY_CURVE_FILE}")
+    print(f"Saved ${CHEAP_MAX_PREMIUM:g}-max trades to {CHEAP_RESULTS_FILE}")
+    print(f"Saved ${CHEAP_MAX_PREMIUM:g}-max equity curve to {CHEAP_EQUITY_CURVE_FILE}")
 
 
 def print_paper_results():

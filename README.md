@@ -35,10 +35,10 @@ ENABLE_NEW_ENTRIES=false
 EXIT_DTE=30
 OPTION_STOP_LOSS_PERCENT=0.30
 OPTION_TRAILING_STOP_PERCENT=0.25
-MAX_PREMIUM_PER_TRADE=100
-REGULAR_MAX_PREMIUM_PER_TRADE=100
-MAX_100_PREMIUM_PER_TRADE=100
-MAX_TOTAL_OPTION_PREMIUM=200
+MAX_PREMIUM_PER_TRADE=500
+REGULAR_MAX_PREMIUM_PER_TRADE=500
+MAX_100_PREMIUM_PER_TRADE=500
+MAX_TOTAL_OPTION_PREMIUM=1000
 MAX_POSITIONS=2
 MAX_POSITIONS_PER_CORRELATION_GROUP=1
 BACKTEST_STARTING_CASH=2500
@@ -67,8 +67,8 @@ indicator periods now represent the same timeframe:
   20-day EMA reclaim, 10-day EMA confirmation, RSI 45–65, and positive MACD
   histogram. It uses a 3% underlying stop, 6% target, and 15-day maximum hold.
 
-Both variants cap entry premium at $100. Across the two variants, at most two
-positions and $200 of entry premium may be open. All contracts are closed by 30
+Both variants cap entry premium at $500. Across the two variants, at most two
+positions and $1,000 of entry premium may be open. All contracts are closed by 30
 DTE, and the 30% option stop is catastrophe protection in addition to the
 underlying and technical exits.
 Only one open or pending position is allowed from each configured correlation
