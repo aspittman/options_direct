@@ -20,15 +20,23 @@ from config import (
     correlation_group,
     ENABLE_NEW_ENTRIES,
     PAPER_STRATEGIES,
+    REENTRY_COOLDOWN_DAYS,
     UNDERLYING_STOP_LOSS_PCT,
     UNDERLYING_TAKE_PROFIT_PCT,
     SCAN_INTERVAL_SECONDS
 )
 
-from analytics import get_strategy_open_lots, get_submitted_orders, record_event
+from analytics import (
+    cooldown_active,
+    get_strategy_open_lots,
+    get_submitted_orders,
+    record_event,
+    signal_bar_already_submitted,
+)
 from bot_logger import bot_log, setup_logging
 from strategy import (
     is_bullish_setup,
+    get_bullish_signal_state,
     is_market_regime_bullish,
     is_underlying_exit_signal,
     wait_for_market_open
@@ -44,6 +52,7 @@ from options_trader import (
     log_analytics_summary,
     reconcile_order_fills,
     bootstrap_legacy_positions,
+    reconcile_strategy_lots_with_broker,
 )
 
 
@@ -58,6 +67,7 @@ def run_bot():
     while True:
         reconcile_order_fills()
         bootstrap_legacy_positions()
+        reconcile_strategy_lots_with_broker()
         log_open_option_positions()
         log_analytics_summary()
         manage_underlying_exits(
@@ -107,7 +117,7 @@ def run_bot():
 
             eligible_variants = []
             for variant in PAPER_STRATEGIES:
-                bullish = is_bullish_setup(
+                state = get_bullish_signal_state(
                     underlying,
                     MA_SHORT,
                     MA_LONG,
@@ -116,13 +126,34 @@ def run_bot():
                     MACD_SIGNAL,
                     signal=variant["signal"],
                 )
-                if bullish:
-                    eligible_variants.append(variant)
-                else:
+                if not state["bullish"]:
                     record_event(
                         "SKIP", strategy=variant["name"], underlying=underlying,
                         reason=f"not_bullish_{variant['signal']}"
                     )
+                elif not state["new_signal"]:
+                    record_event(
+                        "SKIP", strategy=variant["name"], underlying=underlying,
+                        reason="signal_not_new", details=f"signal_date={state['signal_date']}"
+                    )
+                elif signal_bar_already_submitted(
+                    variant["name"], underlying, state["signal_date"]
+                ):
+                    record_event(
+                        "SKIP", strategy=variant["name"], underlying=underlying,
+                        reason="signal_bar_already_traded",
+                        details=f"signal_date={state['signal_date']}"
+                    )
+                elif cooldown_active(
+                    variant["name"], underlying, REENTRY_COOLDOWN_DAYS
+                ):
+                    record_event(
+                        "SKIP", strategy=variant["name"], underlying=underlying,
+                        reason="reentry_cooldown",
+                        details=f"cooldown_trading_days={REENTRY_COOLDOWN_DAYS}"
+                    )
+                else:
+                    eligible_variants.append((variant, state["signal_date"]))
 
             if not eligible_variants:
                 bot_log(f"No daily bullish setup for {underlying}.")
@@ -149,7 +180,7 @@ def run_bot():
                     if row.get("order_side") == "buy":
                         group = correlation_group(row.get("underlying", ""))
                         reserved_group_counts[group] = reserved_group_counts.get(group, 0) + 1
-                for variant in eligible_variants:
+                for variant, signal_date in eligible_variants:
                     strategy_name = variant["name"]
                     if reserved_count >= MAX_POSITIONS:
                         bot_log(
@@ -188,6 +219,7 @@ def run_bot():
                         underlying=underlying,
                         strategy=strategy_name,
                         max_entry_premium=variant["max_premium"],
+                        signal_date=signal_date,
                     )
                     if submitted:
                         reserved_count += 1

@@ -64,6 +64,63 @@ def _daily_indicators(close, ma_short, ma_long, macd_fast, macd_slow, macd_signa
     }
 
 
+def _bullish_at(close, indicators, index, signal):
+    if index < 1:
+        return False
+    values = [
+        close.iloc[index], indicators["ma_short"].iloc[index],
+        indicators["ma_short"].iloc[index - 1], indicators["ma_long"].iloc[index],
+        indicators["macd"].iloc[index], indicators["macd_signal"].iloc[index],
+        indicators["macd_hist"].iloc[index],
+    ]
+    if signal == "daily_swing":
+        values.extend([
+            close.iloc[index - 1], indicators["ema_10"].iloc[index],
+            indicators["ema_20"].iloc[index], indicators["ema_20"].iloc[index - 1],
+            indicators["rsi"].iloc[index],
+        ])
+    if any(value != value for value in values):
+        return False
+
+    latest, ma_short, previous_ma_short, ma_long, macd, macd_signal, macd_hist = values[:7]
+    if signal == "daily_swing":
+        previous, ema_10, ema_20, previous_ema_20, rsi = values[7:]
+        return (
+            latest > ma_long and ma_short > ma_long
+            and previous <= previous_ema_20 and latest > ema_20
+            and latest > ema_10 and 45 <= rsi <= 65 and macd_hist > 0
+        )
+    return (
+        latest > ma_short > ma_long
+        and ma_short > previous_ma_short
+        and macd > macd_signal and macd_hist > 0
+    )
+
+
+def get_bullish_signal_state(
+    symbol, ma_short, ma_long, macd_fast, macd_slow, macd_signal,
+    signal="daily_trend",
+):
+    """Return the completed-bar signal state and whether it just turned bullish."""
+    try:
+        close = _completed_daily_close(symbol)
+        if close is None or len(close) < ma_long + 5:
+            return {"bullish": False, "new_signal": False, "signal_date": ""}
+        indicators = _daily_indicators(
+            close, ma_short, ma_long, macd_fast, macd_slow, macd_signal
+        )
+        current = _bullish_at(close, indicators, len(close) - 1, signal)
+        previous = _bullish_at(close, indicators, len(close) - 2, signal)
+        return {
+            "bullish": current,
+            "new_signal": current and not previous,
+            "signal_date": close.index[-1].date().isoformat(),
+        }
+    except Exception as exc:
+        bot_log(f"Signal-state error for {symbol}: {exc}")
+        return {"bullish": False, "new_signal": False, "signal_date": ""}
+
+
 def is_bullish_setup(
     symbol, ma_short, ma_long, macd_fast, macd_slow, macd_signal,
     signal="daily_trend",
@@ -98,22 +155,14 @@ def is_bullish_setup(
             ema_20 = float(indicators["ema_20"].iloc[-1])
             previous_ema_20 = float(indicators["ema_20"].iloc[-2])
             rsi = float(indicators["rsi"].iloc[-1])
-            bullish = (
-                latest_close > latest_ma_long
-                and latest_ma_short > latest_ma_long
-                and previous_close <= previous_ema_20
-                and latest_close > ema_20
-                and latest_close > ema_10
-                and 45 <= rsi <= 65
-                and latest_macd_hist > 0
-            )
+            bullish = _bullish_at(close, indicators, len(close) - 1, signal)
             bot_log(
                 f"{symbol} daily_swing: close={latest_close:.2f}, EMA20={ema_20:.2f}, "
                 f"RSI={rsi:.2f}, MACD hist={latest_macd_hist:.4f}, bullish={bullish}"
             )
             return bullish
 
-        bullish = in_uptrend and ma_rising and macd_confirmed
+        bullish = _bullish_at(close, indicators, len(close) - 1, signal)
         bot_log(
             f"{symbol} daily_trend: close={latest_close:.2f}, "
             f"MA50={latest_ma_short:.2f}, MA200={latest_ma_long:.2f}, "

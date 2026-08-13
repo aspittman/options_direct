@@ -1,5 +1,5 @@
 import csv
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from config import ANALYTICS_FILE
@@ -93,10 +93,58 @@ def read_events():
         return list(csv.DictReader(file))
 
 
+def latest_strategy_exit_date(strategy, underlying):
+    latest = None
+    for row in read_events():
+        if (
+            row.get("event") == "ORDER_FILL"
+            and row.get("order_side") == "sell"
+            and row.get("strategy") == strategy
+            and row.get("underlying") == underlying
+        ):
+            try:
+                day = datetime.fromisoformat(row.get("timestamp", "")).date()
+            except ValueError:
+                continue
+            latest = max(latest, day) if latest else day
+    return latest
+
+
+def cooldown_active(strategy, underlying, trading_days, today=None):
+    exited = latest_strategy_exit_date(strategy, underlying)
+    if not exited or trading_days <= 0:
+        return False
+    cursor = exited
+    elapsed = 0
+    today = today or date.today()
+    while cursor < today:
+        cursor += timedelta(days=1)
+        if cursor.weekday() < 5:
+            elapsed += 1
+    return elapsed < trading_days
+
+
+def signal_bar_already_submitted(strategy, underlying, signal_date):
+    marker = f"signal_date={signal_date}"
+    return any(
+        row.get("event") == "ORDER_SUBMITTED"
+        and row.get("order_side") == "buy"
+        and row.get("strategy") == strategy
+        and row.get("underlying") == underlying
+        and marker in row.get("details", "")
+        for row in read_events()
+    )
+
+
 def get_strategy_open_lots():
     """Return net filled quantities and cost basis for each strategy contract."""
     lots = {}
     for row in read_events():
+        if row.get("event") == "POSITION_MISSING":
+            key = (row.get("strategy", ""), row.get("underlying", ""), row.get("option_symbol", ""))
+            if key in lots:
+                lots[key].update(qty=0.0, cost=0.0, underlying_cost=0.0, opened_at="")
+            continue
         if row.get("event") != "ORDER_FILL":
             continue
         strategy = row.get("strategy", "")
@@ -172,6 +220,11 @@ def summarize_results():
         symbol = row.get("option_symbol", "")
         if row.get("event") == "POSITION_SNAPSHOT" and symbol:
             latest_prices[symbol] = float(row.get("price") or 0)
+        if row.get("event") == "POSITION_MISSING":
+            key = (row.get("strategy", ""), row.get("underlying", ""), symbol)
+            if key in inventory:
+                inventory[key].update(qty=0.0, cost=0.0)
+            continue
         if row.get("event") != "ORDER_FILL":
             continue
         strategy = row.get("strategy", "")
@@ -236,6 +289,11 @@ def build_strategy_report(strategy_names=()):
         symbol = row.get("option_symbol", "")
         if row.get("event") == "POSITION_SNAPSHOT" and symbol:
             latest_prices[symbol] = float(row.get("price") or 0)
+        if row.get("event") == "POSITION_MISSING":
+            key = (row.get("strategy", ""), row.get("underlying", ""), symbol)
+            if key in inventory:
+                inventory[key].update(qty=0.0, cost=0.0)
+            continue
         if row.get("event") != "ORDER_FILL":
             continue
         strategy = row.get("strategy", "")

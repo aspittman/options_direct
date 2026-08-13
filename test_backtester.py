@@ -1,9 +1,12 @@
 import unittest
+from datetime import date
+from unittest.mock import patch
 
 import pandas as pd
 
 from backtester import apply_portfolio_constraints, build_swing_signals, is_swing_entry_at
 from config import correlation_group
+from analytics import cooldown_active, signal_bar_already_submitted
 
 
 def trade(symbol, entry_date, exit_date, entry_price, exit_price):
@@ -116,6 +119,31 @@ class CorrelationGroupTests(unittest.TestCase):
 
     def test_unlisted_symbol_gets_its_own_group(self):
         self.assertEqual(correlation_group("OTHER"), "OTHER")
+
+
+class EntryGuardTests(unittest.TestCase):
+    @patch("analytics.read_events")
+    def test_cooldown_counts_trading_days(self, read_events):
+        read_events.return_value = [{
+            "timestamp": "2026-08-07T12:00:00", "event": "ORDER_FILL",
+            "order_side": "sell", "strategy": "regular", "underlying": "SPY",
+        }]
+        self.assertTrue(cooldown_active(
+            "regular", "SPY", 5, today=date(2026, 8, 12)
+        ))
+        self.assertFalse(cooldown_active(
+            "regular", "SPY", 3, today=date(2026, 8, 12)
+        ))
+
+    @patch("analytics.read_events")
+    def test_signal_bar_can_only_be_submitted_once(self, read_events):
+        read_events.return_value = [{
+            "event": "ORDER_SUBMITTED", "order_side": "buy",
+            "strategy": "regular", "underlying": "SPY",
+            "details": "signal_date=2026-08-11;limit_price=5.00",
+        }]
+        self.assertTrue(signal_bar_already_submitted("regular", "SPY", "2026-08-11"))
+        self.assertFalse(signal_bar_already_submitted("regular", "SPY", "2026-08-12"))
 
 
 if __name__ == "__main__":

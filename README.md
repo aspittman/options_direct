@@ -34,7 +34,9 @@ Optional option-risk settings (shown with defaults):
 ENABLE_NEW_ENTRIES=false
 EXIT_DTE=30
 OPTION_STOP_LOSS_PERCENT=0.30
-OPTION_TRAILING_STOP_PERCENT=0.25
+OPTION_TRAILING_STOP_PERCENT=0
+REENTRY_COOLDOWN_DAYS=5
+LIMIT_ORDER_TIMEOUT_MINUTES=15
 MAX_PREMIUM_PER_TRADE=500
 REGULAR_MAX_PREMIUM_PER_TRADE=500
 MAX_100_PREMIUM_PER_TRADE=500
@@ -67,10 +69,16 @@ indicator periods now represent the same timeframe:
   20-day EMA reclaim, 10-day EMA confirmation, RSI 45–65, and positive MACD
   histogram. It uses a 3% underlying stop, 6% target, and 15-day maximum hold.
 
+Entries require a fresh false-to-true signal on a newly completed daily candle,
+and an underlying cannot be re-entered by the same strategy for five trading days
+after an exit. Orders use midpoint day-limit prices rather than market orders and
+are canceled if they remain unfilled for 15 minutes.
+
 Both variants cap entry premium at $500. Across the two variants, at most two
 positions and $1,000 of entry premium may be open. All contracts are closed by 30
 DTE, and the 30% option stop is catastrophe protection in addition to the
-underlying and technical exits.
+underlying and technical exits. The option trailing stop is disabled by default;
+underlying and completed-daily technical signals drive normal exits.
 Only one open or pending position is allowed from each configured correlation
 group (broad indexes, technology, financials, energy, healthcare, and
 consumer/industrial), preventing both slots from expressing essentially the same

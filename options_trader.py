@@ -13,7 +13,7 @@ from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
     ClosePositionRequest,
-    MarketOrderRequest,
+    LimitOrderRequest,
     GetOptionContractsRequest
 )
 from alpaca.trading.enums import (
@@ -42,6 +42,7 @@ from config import (
     OPTION_STOP_LOSS_PERCENT,
     OPTION_TRAILING_STOP_PERCENT,
     PAPER_STRATEGIES,
+    LIMIT_ORDER_TIMEOUT_MINUTES,
     require_alpaca_credentials
 )
 from analytics import (
@@ -365,7 +366,9 @@ def get_option_contract(underlying, option_type="call", min_dte=30, max_dte=60):
     contracts = [
         contract
         for contract in contracts
-        if contract.tradable and (_to_float(contract.open_interest) or 0) > MIN_OPEN_INTEREST
+        if contract.tradable
+        and min_dte <= (contract.expiration_date - today).days <= max_dte
+        and (_to_float(contract.open_interest) or 0) > MIN_OPEN_INTEREST
     ]
 
     if not contracts:
@@ -511,6 +514,25 @@ def reconcile_order_fills():
                 order_status=status,
                 reason="unfilled_terminal_order",
             )
+        elif LIMIT_ORDER_TIMEOUT_MINUTES > 0:
+            try:
+                submitted_at = datetime.fromisoformat(
+                    submitted.get("timestamp", "").replace("Z", "+00:00")
+                )
+                now = datetime.now(submitted_at.tzinfo) if submitted_at.tzinfo else datetime.now()
+                age = now - submitted_at
+                if age >= timedelta(minutes=LIMIT_ORDER_TIMEOUT_MINUTES):
+                    trading_client.cancel_order_by_id(order_id)
+                    record_event(
+                        "ORDER_TERMINAL", strategy=submitted.get("strategy", ""),
+                        underlying=submitted.get("underlying", ""),
+                        option_symbol=submitted.get("option_symbol", ""),
+                        order_id=order_id, order_side=submitted.get("order_side", ""),
+                        order_status="cancel_requested", reason="limit_order_timeout",
+                    )
+                    bot_log(f"Canceled stale unfilled limit order {order_id}")
+            except (ValueError, APIError, RequestException) as exc:
+                bot_log(f"Could not cancel stale order {order_id}: {exc}")
 
 
 def bootstrap_legacy_positions():
@@ -544,8 +566,39 @@ def bootstrap_legacy_positions():
         bot_log(f"Adopted legacy paper position as regular: {symbol} qty={missing_qty:g}")
 
 
+def reconcile_strategy_lots_with_broker():
+    """Stop stale virtual lots from surviving after the broker position is gone."""
+    try:
+        account_symbols = {
+            position.symbol for position in trading_client.get_all_positions()
+            if parse_option_symbol(position.symbol)
+        }
+    except Exception as exc:
+        bot_log(f"Broker/ledger reconciliation skipped: {exc}")
+        return
+    pending_sells = {
+        (row.get("strategy", ""), row.get("option_symbol", ""))
+        for row in get_submitted_orders().values()
+        if row.get("order_side") == "sell"
+    }
+    for (strategy, underlying, symbol), lot in get_strategy_open_lots().items():
+        if symbol in account_symbols or (strategy, symbol) in pending_sells:
+            continue
+        record_event(
+            "POSITION_MISSING", strategy=strategy, underlying=underlying,
+            option_symbol=symbol, qty=lot["qty"],
+            reason="broker_position_absent",
+            details="virtual lot cleared without realized P/L; broker is authoritative",
+        )
+        bot_log(
+            f"Cleared stale virtual lot strategy={strategy} contract={symbol}: "
+            "position absent at broker"
+        )
+
+
 def buy_option_contract(
-    option_symbol, qty=1, underlying="", strategy="regular", max_entry_premium=None
+    option_symbol, qty=1, underlying="", strategy="regular", max_entry_premium=None,
+    signal_date="",
 ):
     positions = get_options_direct_positions()
     parsed = parse_option_symbol(option_symbol)
@@ -593,18 +646,20 @@ def buy_option_contract(
         record_event("SKIP", underlying=underlying, option_symbol=option_symbol, reason="max_total_option_premium")
         return
 
-    order = MarketOrderRequest(
+    limit_price = round(estimated_price, 2)
+    order = LimitOrderRequest(
         symbol=option_symbol,
         qty=qty,
         side=OrderSide.BUY,
         time_in_force=TimeInForce.DAY,
+        limit_price=limit_price,
         client_order_id=f"od-{strategy}-{int(datetime.now().timestamp() * 1000)}"
     )
 
     try:
         submitted_order = trading_client.submit_order(order)
         underlying_price = get_underlying_price(underlying) if underlying else ""
-        bot_log(f"Placed BUY order for {qty} option contract(s): {option_symbol}")
+        bot_log(f"Placed midpoint LIMIT BUY for {qty} {option_symbol} at ${limit_price:.2f}")
         record_event(
             "ORDER_SUBMITTED",
             strategy=strategy,
@@ -617,7 +672,8 @@ def buy_option_contract(
             order_side="buy",
             order_status=str(getattr(submitted_order, "status", "")),
             details=(f"order_id={getattr(submitted_order, 'id', '')};"
-                     f"underlying_price={underlying_price};estimated_premium={estimated_premium:.2f}")
+                     f"underlying_price={underlying_price};estimated_premium={estimated_premium:.2f};"
+                     f"signal_date={signal_date};limit_price={limit_price:.2f}")
         )
         return True
 
@@ -684,11 +740,24 @@ def close_strategy_lot(strategy, underlying, option_symbol, qty, reason):
     """Sell only the quantity assigned to one virtual strategy."""
     if _strategy_has_pending_order(strategy, option_symbol, "sell"):
         return
-    order = MarketOrderRequest(
+    snapshot = get_option_snapshots([option_symbol]).get(option_symbol)
+    quote = getattr(snapshot, "latest_quote", None)
+    bid = _to_float(getattr(quote, "bid_price", None)) or 0
+    ask = _to_float(getattr(quote, "ask_price", None)) or 0
+    if bid <= 0 or ask <= 0 or ask < bid:
+        bot_log(f"Cannot place safe limit exit for {option_symbol}: invalid quote")
+        record_event(
+            "SKIP", strategy=strategy, underlying=underlying,
+            option_symbol=option_symbol, reason="invalid_exit_quote"
+        )
+        return
+    limit_price = round((bid + ask) / 2, 2)
+    order = LimitOrderRequest(
         symbol=option_symbol,
         qty=qty,
         side=OrderSide.SELL,
         time_in_force=TimeInForce.DAY,
+        limit_price=limit_price,
         client_order_id=f"od-{strategy}-x-{int(datetime.now().timestamp() * 1000)}",
     )
     try:
@@ -704,9 +773,11 @@ def close_strategy_lot(strategy, underlying, option_symbol, qty, reason):
             order_id=str(getattr(submitted, "id", "")),
             order_side="sell",
             order_status=str(getattr(submitted, "status", "")),
+            details=f"limit_price={limit_price:.2f}",
         )
         bot_log(
-            f"Submitted PAPER SELL strategy={strategy} contract={option_symbol} qty={qty:g}: {reason}"
+            f"Submitted midpoint LIMIT SELL strategy={strategy} contract={option_symbol} "
+            f"qty={qty:g} limit=${limit_price:.2f}: {reason}"
         )
     except (APIError, RequestException) as exc:
         bot_log(f"Strategy exit failed strategy={strategy} contract={option_symbol}: {exc}")
