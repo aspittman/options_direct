@@ -1,12 +1,21 @@
 import unittest
 from datetime import date
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 
 from backtester import apply_portfolio_constraints, build_swing_signals, is_swing_entry_at
 from config import correlation_group
-from analytics import cooldown_active, signal_bar_already_submitted
+from analytics import (
+    cooldown_active,
+    get_underlying_high_water_marks,
+    signal_bar_already_submitted,
+)
+from options_trader import (
+    calculate_underlying_trailing_stop,
+    close_strategy_lot,
+    has_earnings_soon,
+)
 
 
 def trade(symbol, entry_date, exit_date, entry_price, exit_price):
@@ -122,6 +131,19 @@ class CorrelationGroupTests(unittest.TestCase):
 
 
 class EntryGuardTests(unittest.TestCase):
+    @patch("options_trader.record_event")
+    @patch("options_trader.yf.Ticker")
+    def test_earnings_check_failure_blocks_entry(self, ticker, record_event):
+        ticker.return_value.get_earnings_dates.side_effect = ImportError("missing parser")
+
+        self.assertTrue(has_earnings_soon("AAPL"))
+        record_event.assert_called_once_with(
+            "SKIP",
+            underlying="AAPL",
+            reason="earnings_check_failed",
+            details="error=ImportError",
+        )
+
     @patch("analytics.read_events")
     def test_cooldown_counts_trading_days(self, read_events):
         read_events.return_value = [{
@@ -144,6 +166,83 @@ class EntryGuardTests(unittest.TestCase):
         }]
         self.assertTrue(signal_bar_already_submitted("regular", "SPY", "2026-08-11"))
         self.assertFalse(signal_bar_already_submitted("regular", "SPY", "2026-08-12"))
+
+
+class TrailingStopTests(unittest.TestCase):
+    def test_stop_rises_with_stock_and_never_moves_back_down(self):
+        high, stop = calculate_underlying_trailing_stop(100, 105, 103, 0.03)
+        self.assertEqual(high, 105)
+        self.assertAlmostEqual(stop, 101.85)
+
+        lower_high, lower_stop = calculate_underlying_trailing_stop(
+            100, 102, high, 0.03
+        )
+        self.assertEqual(lower_high, 105)
+        self.assertAlmostEqual(lower_stop, 101.85)
+
+    @patch("analytics.read_events")
+    def test_high_water_is_rebuilt_after_restart(self, read_events):
+        read_events.return_value = [
+            {
+                "event": "ORDER_FILL", "order_side": "buy", "qty": "1",
+                "strategy": "regular", "underlying": "BAC",
+                "option_symbol": "BAC261016C00062500", "underlying_price": "64",
+            },
+            {
+                "event": "RISK_SNAPSHOT", "strategy": "regular",
+                "underlying": "BAC", "option_symbol": "BAC261016C00062500",
+                "underlying_price": "67",
+            },
+            {
+                "event": "RISK_SNAPSHOT", "strategy": "regular",
+                "underlying": "BAC", "option_symbol": "BAC261016C00062500",
+                "underlying_price": "65",
+            },
+        ]
+
+        marks = get_underlying_high_water_marks()
+        self.assertEqual(marks[("regular", "BAC", "BAC261016C00062500")], 67)
+
+    @patch("analytics.read_events")
+    def test_closed_lot_does_not_leak_high_water_into_reentry(self, read_events):
+        common = {
+            "strategy": "regular", "underlying": "BAC",
+            "option_symbol": "BAC261016C00062500",
+        }
+        read_events.return_value = [
+            {**common, "event": "ORDER_FILL", "order_side": "buy", "qty": "1",
+             "underlying_price": "64"},
+            {**common, "event": "RISK_SNAPSHOT", "underlying_price": "70"},
+            {**common, "event": "ORDER_FILL", "order_side": "sell", "qty": "1",
+             "underlying_price": "68"},
+            {**common, "event": "ORDER_FILL", "order_side": "buy", "qty": "1",
+             "underlying_price": "60"},
+        ]
+
+        marks = get_underlying_high_water_marks()
+        self.assertEqual(marks[("regular", "BAC", "BAC261016C00062500")], 60)
+
+    @patch("options_trader.record_event")
+    @patch("options_trader.get_underlying_price", return_value=64)
+    @patch("options_trader.trading_client.submit_order")
+    @patch("options_trader.get_option_snapshots")
+    @patch("options_trader._strategy_has_pending_order", return_value=False)
+    def test_risk_exit_uses_marketable_bid_limit(
+        self, _pending, snapshots, submit_order, _price, _record_event
+    ):
+        quote = MagicMock(bid_price=3.10, ask_price=3.30)
+        snapshots.return_value = {
+            "BAC261016C00062500": MagicMock(latest_quote=quote)
+        }
+        submit_order.return_value = MagicMock(id="order-1", status="pending_new")
+
+        close_strategy_lot(
+            "regular", "BAC", "BAC261016C00062500", 1,
+            "underlying_trailing_stop_-3.00%",
+        )
+
+        order = submit_order.call_args.args[0]
+        self.assertEqual(float(order.limit_price), 3.10)
 
 
 if __name__ == "__main__":

@@ -19,6 +19,7 @@ from config import (
     OPTION_STOP_LOSS_PERCENT,
     OPTION_TAKE_PROFIT_PERCENT,
     TARGET_DELTA,
+    UNDERLYING_TRAILING_STOP_PERCENT,
     UNDERLYINGS,
     PAPER_STRATEGIES,
     MAX_POSITIONS,
@@ -201,6 +202,7 @@ def backtest_underlying_signal(symbol, close, strategy):
     swing_indicators = build_swing_signals(close)
     trades = []
     entry_index = None
+    underlying_high = None
 
     for index in range(minimum_bars, len(close)):
         if entry_index is None:
@@ -211,16 +213,18 @@ def backtest_underlying_signal(symbol, close, strategy):
             )
             if enters:
                 entry_index = index
+                underlying_high = float(close.iloc[index])
             continue
 
         entry_price = float(close.iloc[entry_index])
         exit_price = float(close.iloc[index])
         return_pct = (exit_price - entry_price) / entry_price
+        underlying_high = max(underlying_high, exit_price)
         reason = ""
-        if strategy == "swing":
-            if return_pct <= -SWING_STOP_LOSS_PERCENT:
-                reason = "underlying_stop_loss"
-            elif return_pct >= SWING_TAKE_PROFIT_PERCENT:
+        if exit_price <= underlying_high * (1 - UNDERLYING_TRAILING_STOP_PERCENT):
+            reason = "underlying_trailing_stop"
+        elif strategy == "swing":
+            if return_pct >= SWING_TAKE_PROFIT_PERCENT:
                 reason = "underlying_take_profit"
             elif index - entry_index >= SWING_MAX_HOLDING_DAYS:
                 reason = "max_holding_days"
@@ -244,6 +248,7 @@ def backtest_underlying_signal(symbol, close, strategy):
                 "exit_reason": reason,
             })
             entry_index = None
+            underlying_high = None
 
     return trades
 
@@ -463,6 +468,7 @@ def backtest_close(symbol, close, max_entry_premium=None, strategy="current"):
     trades = []
     entry_index = None
     option_position = None
+    underlying_high = None
 
     for index in range(minimum_bars, len(close)):
         if entry_index is None:
@@ -477,6 +483,7 @@ def backtest_close(symbol, close, max_entry_premium=None, strategy="current"):
                 if max_entry_premium is None or entry_premium <= max_entry_premium:
                     entry_index = index
                     option_position = candidate
+                    underlying_high = float(close.iloc[index])
             continue
 
         option_entry_price = option_position["entry_price"]
@@ -492,12 +499,14 @@ def backtest_close(symbol, close, max_entry_premium=None, strategy="current"):
         underlying_return = (
             float(close.iloc[index]) - float(close.iloc[entry_index])
         ) / float(close.iloc[entry_index])
+        underlying_price = float(close.iloc[index])
+        underlying_high = max(underlying_high, underlying_price)
         if option_pnl_pct <= -OPTION_STOP_LOSS_PERCENT:
             exit_reason = "option_stop_loss"
         elif option_pnl_pct >= OPTION_TAKE_PROFIT_PERCENT:
             exit_reason = "option_take_profit"
-        elif strategy == "swing" and underlying_return <= -SWING_STOP_LOSS_PERCENT:
-            exit_reason = "underlying_stop_loss"
+        elif underlying_price <= underlying_high * (1 - UNDERLYING_TRAILING_STOP_PERCENT):
+            exit_reason = "underlying_trailing_stop"
         elif strategy == "swing" and underlying_return >= SWING_TAKE_PROFIT_PERCENT:
             exit_reason = "underlying_take_profit"
         elif index - entry_index >= (
@@ -525,6 +534,7 @@ def backtest_close(symbol, close, max_entry_premium=None, strategy="current"):
             ))
             entry_index = None
             option_position = None
+            underlying_high = None
 
     if entry_index is not None:
         trades.append(build_trade(

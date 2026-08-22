@@ -6,6 +6,7 @@ cffi==2.0.0
 charset-normalizer==3.4.7
 curl_cffi==0.15.0
 idna==3.16
+lxml==6.0.2
 markdown-it-py==4.2.0
 mdurl==0.1.2
 msgpack==1.1.2

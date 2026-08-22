@@ -21,7 +21,7 @@ from config import (
     ENABLE_NEW_ENTRIES,
     PAPER_STRATEGIES,
     REENTRY_COOLDOWN_DAYS,
-    UNDERLYING_STOP_LOSS_PCT,
+    UNDERLYING_TRAILING_STOP_PERCENT,
     UNDERLYING_TAKE_PROFIT_PCT,
     SCAN_INTERVAL_SECONDS
 )
@@ -65,6 +65,8 @@ def run_bot():
         bot_log("New entries are disabled; existing positions will still be managed.")
 
     while True:
+        # Re-check every cycle so stale overnight/weekend quotes are not used.
+        wait_for_market_open(trading_client)
         reconcile_order_fills()
         bootstrap_legacy_positions()
         reconcile_strategy_lots_with_broker()
@@ -81,7 +83,7 @@ def run_bot():
                 MACD_SIGNAL,
                 signal=signal,
             ),
-            UNDERLYING_STOP_LOSS_PCT,
+            UNDERLYING_TRAILING_STOP_PERCENT,
             UNDERLYING_TAKE_PROFIT_PCT
         )
 

@@ -105,12 +105,15 @@ MAX_PREMIUM_PER_TRADE = _env_float("MAX_PREMIUM_PER_TRADE", 500.0)
 MAX_TOTAL_OPTION_PREMIUM = _env_float("MAX_TOTAL_OPTION_PREMIUM", 1000.0)
 REGULAR_MAX_PREMIUM_PER_TRADE = _env_float("REGULAR_MAX_PREMIUM_PER_TRADE", 500.0)
 MAX_100_PREMIUM_PER_TRADE = _env_float("MAX_100_PREMIUM_PER_TRADE", 500.0)
+UNDERLYING_TRAILING_STOP_PERCENT = _env_float(
+    "UNDERLYING_TRAILING_STOP_PERCENT", 0.03
+)
 PAPER_STRATEGIES = (
     {
         "name": "regular",
         "signal": "daily_trend",
         "max_premium": REGULAR_MAX_PREMIUM_PER_TRADE or None,
-        "underlying_stop_loss": 0.03,
+        "underlying_trailing_stop": UNDERLYING_TRAILING_STOP_PERCENT,
         "underlying_take_profit": 0.08,
         "max_holding_days": 20,
     },
@@ -118,7 +121,7 @@ PAPER_STRATEGIES = (
         "name": "max_100",
         "signal": "daily_swing",
         "max_premium": MAX_100_PREMIUM_PER_TRADE,
-        "underlying_stop_loss": 0.03,
+        "underlying_trailing_stop": UNDERLYING_TRAILING_STOP_PERCENT,
         "underlying_take_profit": 0.06,
         "max_holding_days": 15,
     },
@@ -171,7 +174,6 @@ MARKET_REGIME_SYMBOL = "SPY"
 MARKET_REGIME_SHORT_MA = 50
 MARKET_REGIME_LONG_MA = 200
 
-UNDERLYING_STOP_LOSS_PCT = 0.03
 UNDERLYING_TAKE_PROFIT_PCT = 0.08
 
 BACKTEST_ENTRY_DTE = 75
@@ -184,6 +186,7 @@ EXIT_DTE = _env_int("EXIT_DTE", 30)
 MAX_HOLDING_DAYS = 20
 REENTRY_COOLDOWN_DAYS = _env_int("REENTRY_COOLDOWN_DAYS", 5)
 LIMIT_ORDER_TIMEOUT_MINUTES = _env_int("LIMIT_ORDER_TIMEOUT_MINUTES", 15)
+EXIT_LIMIT_TIMEOUT_MINUTES = _env_int("EXIT_LIMIT_TIMEOUT_MINUTES", 2)
 
 OPTION_TYPE = "call"  # start with calls only
 CONTRACT_QTY = 1

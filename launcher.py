@@ -2,13 +2,17 @@ import subprocess
 import sys
 import time
 from datetime import datetime
+from pathlib import Path
 
 RESTART_DELAY_SECONDS = 30
+PROJECT_DIR = Path(__file__).resolve().parent
+VENV_PYTHON = PROJECT_DIR / "venv" / "bin" / "python"
+BOT_PYTHON = str(VENV_PYTHON) if VENV_PYTHON.exists() else sys.executable
 
 while True:
     print("\nStarting options bot...")
 
-    result = subprocess.run([sys.executable, "main.py"])
+    result = subprocess.run([BOT_PYTHON, str(PROJECT_DIR / "main.py")])
 
     print(f"Options bot exited with return code: {result.returncode}")
 

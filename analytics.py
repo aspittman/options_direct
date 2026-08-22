@@ -175,6 +175,39 @@ def get_strategy_open_lots():
     return {key: value for key, value in lots.items() if value["qty"] > 0}
 
 
+def get_underlying_high_water_marks():
+    """Rebuild open-lot stock-price highs from the durable event ledger."""
+    positions = {}
+    high_water_marks = {}
+    for row in read_events():
+        strategy = row.get("strategy", "")
+        underlying = row.get("underlying", "")
+        symbol = row.get("option_symbol", "")
+        if not strategy or not underlying or not symbol:
+            continue
+        key = (strategy, underlying, symbol)
+        if row.get("event") == "POSITION_MISSING":
+            positions[key] = 0.0
+            high_water_marks.pop(key, None)
+            continue
+        if row.get("event") == "ORDER_FILL":
+            qty = float(row.get("qty") or 0)
+            if row.get("order_side") == "buy":
+                if positions.get(key, 0) <= 0:
+                    high_water_marks.pop(key, None)
+                positions[key] = positions.get(key, 0) + qty
+            elif row.get("order_side") == "sell":
+                positions[key] = max(positions.get(key, 0) - qty, 0)
+                if positions[key] <= 0:
+                    high_water_marks.pop(key, None)
+        if positions.get(key, 0) <= 0:
+            continue
+        price = float(row.get("underlying_price") or 0)
+        if price > 0 and row.get("event") in {"ORDER_FILL", "RISK_SNAPSHOT"}:
+            high_water_marks[key] = max(high_water_marks.get(key, price), price)
+    return high_water_marks
+
+
 def get_submitted_orders():
     """Return strategy orders that still need their fills reconciled."""
     submitted = {}

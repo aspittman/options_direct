@@ -43,11 +43,13 @@ from config import (
     OPTION_TRAILING_STOP_PERCENT,
     PAPER_STRATEGIES,
     LIMIT_ORDER_TIMEOUT_MINUTES,
+    EXIT_LIMIT_TIMEOUT_MINUTES,
     require_alpaca_credentials
 )
 from analytics import (
     get_owned_option_symbols,
     get_strategy_open_lots,
+    get_underlying_high_water_marks,
     get_submitted_orders,
     record_event,
     summarize_results,
@@ -72,16 +74,21 @@ def _option_feed():
 def _to_float(value):
     if value is None:
         return None
-
     try:
         return float(value)
     except (TypeError, ValueError):
         return None
 
 
+def calculate_underlying_trailing_stop(entry_price, current_price, prior_high, trail_pct):
+    """Return a ratcheting high-water mark and its trailing stop price."""
+    high_water = max(entry_price, current_price, prior_high or entry_price)
+    return high_water, high_water * (1 - trail_pct)
+
+
 OPTION_SYMBOL_RE = re.compile(r"^([A-Z.]+)(\d{6})([CP])(\d{8})$")
 CONTRACT_MULTIPLIER = 100
-_high_water_marks = {}
+_option_high_water_marks = {}
 
 
 def parse_option_symbol(symbol):
@@ -199,7 +206,15 @@ def has_earnings_soon(underlying, skip_days=EARNINGS_SKIP_DAYS):
 
     except Exception as e:
         bot_log(f"Could not check earnings for {underlying}: {e}")
-        return False
+        record_event(
+            "SKIP",
+            underlying=underlying,
+            reason="earnings_check_failed",
+            details=f"error={type(e).__name__}",
+        )
+        # Earnings protection is a risk control. If its data source or parser is
+        # unavailable, do not assume that opening a new position is safe.
+        return True
 
 
 def get_underlying_price(underlying):
@@ -514,14 +529,21 @@ def reconcile_order_fills():
                 order_status=status,
                 reason="unfilled_terminal_order",
             )
-        elif LIMIT_ORDER_TIMEOUT_MINUTES > 0:
+        else:
+            timeout_minutes = (
+                EXIT_LIMIT_TIMEOUT_MINUTES
+                if submitted.get("order_side") == "sell"
+                else LIMIT_ORDER_TIMEOUT_MINUTES
+            )
+            if timeout_minutes <= 0:
+                continue
             try:
                 submitted_at = datetime.fromisoformat(
                     submitted.get("timestamp", "").replace("Z", "+00:00")
                 )
                 now = datetime.now(submitted_at.tzinfo) if submitted_at.tzinfo else datetime.now()
                 age = now - submitted_at
-                if age >= timedelta(minutes=LIMIT_ORDER_TIMEOUT_MINUTES):
+                if age >= timedelta(minutes=timeout_minutes):
                     trading_client.cancel_order_by_id(order_id)
                     record_event(
                         "ORDER_TERMINAL", strategy=submitted.get("strategy", ""),
@@ -751,7 +773,9 @@ def close_strategy_lot(strategy, underlying, option_symbol, qty, reason):
             option_symbol=option_symbol, reason="invalid_exit_quote"
         )
         return
-    limit_price = round((bid + ask) / 2, 2)
+    # Once risk has triggered, prioritize execution. A sell limit at the live
+    # bid is normally marketable while still enforcing a minimum sale price.
+    limit_price = round(bid, 2)
     order = LimitOrderRequest(
         symbol=option_symbol,
         qty=qty,
@@ -776,7 +800,7 @@ def close_strategy_lot(strategy, underlying, option_symbol, qty, reason):
             details=f"limit_price={limit_price:.2f}",
         )
         bot_log(
-            f"Submitted midpoint LIMIT SELL strategy={strategy} contract={option_symbol} "
+            f"Submitted marketable LIMIT SELL strategy={strategy} contract={option_symbol} "
             f"qty={qty:g} limit=${limit_price:.2f}: {reason}"
         )
     except (APIError, RequestException) as exc:
@@ -790,13 +814,14 @@ def close_strategy_lot(strategy, underlying, option_symbol, qty, reason):
 def manage_underlying_exits(
     underlyings,
     exit_signal_func,
-    stop_loss_pct,
+    trailing_stop_pct,
     take_profit_pct
 ):
     positions_by_symbol = {
         position.symbol: position for position in get_options_direct_positions()
     }
     lots = get_strategy_open_lots()
+    underlying_high_water_marks = get_underlying_high_water_marks()
     for underlying in underlyings:
         underlying_lots = [
             (key, lot) for key, lot in lots.items() if key[1] == underlying
@@ -811,7 +836,7 @@ def manage_underlying_exits(
                 (item for item in PAPER_STRATEGIES if item["name"] == strategy),
                 {
                     "signal": "daily_trend",
-                    "underlying_stop_loss": stop_loss_pct,
+                    "underlying_trailing_stop": trailing_stop_pct,
                     "underlying_take_profit": take_profit_pct,
                     "max_holding_days": 20,
                 },
@@ -845,9 +870,12 @@ def manage_underlying_exits(
                     bot_log(
                         f"Could not parse entry timestamp for {option_symbol}: {opened_at}"
                     )
-            high_water_key = (strategy, option_symbol)
-            high_water = max(_high_water_marks.get(high_water_key, option_price), option_price)
-            _high_water_marks[high_water_key] = high_water
+            option_high_water_key = (strategy, option_symbol)
+            option_high_water = max(
+                _option_high_water_marks.get(option_high_water_key, option_price),
+                option_price,
+            )
+            _option_high_water_marks[option_high_water_key] = option_high_water
 
             if dte <= EXIT_DTE:
                 exit_reason = f"expiration_management_dte_{dte}"
@@ -857,18 +885,40 @@ def manage_underlying_exits(
                 exit_reason = f"max_holding_days_{held_weekdays}"
             elif (
                 OPTION_TRAILING_STOP_PERCENT > 0
-                and high_water > 0
-                and option_price <= high_water * (1 - OPTION_TRAILING_STOP_PERCENT)
+                and option_high_water > 0
+                and option_price <= option_high_water * (1 - OPTION_TRAILING_STOP_PERCENT)
             ):
-                drawdown = (option_price - high_water) / high_water
+                drawdown = (option_price - option_high_water) / option_high_water
                 exit_reason = f"option_trailing_stop_{drawdown:.2%}"
 
             if current_price and entry_price:
-                change_pct = (current_price - entry_price) / entry_price
+                risk_key = (strategy, underlying, option_symbol)
+                previous_high = underlying_high_water_marks.get(risk_key, entry_price)
+                trailing_pct = variant["underlying_trailing_stop"]
+                underlying_high, trailing_stop = calculate_underlying_trailing_stop(
+                    entry_price, current_price, previous_high, trailing_pct
+                )
+                underlying_high_water_marks[risk_key] = underlying_high
+                record_event(
+                    "RISK_SNAPSHOT",
+                    strategy=strategy,
+                    underlying=underlying,
+                    option_symbol=option_symbol,
+                    qty=lot["qty"],
+                    price=option_price,
+                    underlying_price=current_price,
+                    details=(
+                        f"underlying_high_water={underlying_high:.6f};"
+                        f"underlying_trailing_stop={trailing_stop:.6f};"
+                        f"trailing_percent={trailing_pct:.6f}"
+                    ),
+                )
 
-                if change_pct <= -variant["underlying_stop_loss"]:
-                    exit_reason = f"underlying_stop_loss_{change_pct:.2%}"
-                elif change_pct >= variant["underlying_take_profit"]:
+                if current_price <= trailing_stop:
+                    drawdown = (current_price - underlying_high) / underlying_high
+                    exit_reason = f"underlying_trailing_stop_{drawdown:.2%}"
+                elif (current_price - entry_price) / entry_price >= variant["underlying_take_profit"]:
+                    change_pct = (current_price - entry_price) / entry_price
                     exit_reason = f"underlying_take_profit_{change_pct:.2%}"
 
             if exit_reason:
@@ -877,6 +927,6 @@ def manage_underlying_exits(
                 )
 
     open_keys = {(strategy, symbol) for strategy, _, symbol in lots}
-    for key in list(_high_water_marks):
+    for key in list(_option_high_water_marks):
         if key not in open_keys:
-            del _high_water_marks[key]
+            del _option_high_water_marks[key]
