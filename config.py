@@ -19,6 +19,7 @@ def _first_env_value(names):
 API_KEY = _first_env_value(ALPACA_API_KEY_ENV_NAMES)
 SECRET_KEY = _first_env_value(ALPACA_SECRET_KEY_ENV_NAMES)
 ALPACA_PAPER = os.getenv("ALPACA_PAPER", "true").lower() == "true"
+BOT_PERFORMANCE_START_DATE = os.getenv("BOT_PERFORMANCE_START_DATE", "2026-08-21")
 
 
 def require_alpaca_credentials():

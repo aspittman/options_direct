@@ -299,6 +299,86 @@ def summarize_results():
     return results
 
 
+def summarize_performance_since(start_date, current_prices=None, strategy=None):
+    """Return bot-only fill performance from a fixed date onward.
+
+    Return percentage uses gross buy premium deployed as its denominator. Fills
+    before the cutoff are deliberately excluded so earlier/shared-bot activity
+    cannot leak into this bot's reported performance period.
+    """
+    cutoff = (
+        start_date if isinstance(start_date, date)
+        else date.fromisoformat(str(start_date))
+    )
+    current_prices = current_prices or {}
+    inventory = {}
+    deployed_premium = 0.0
+    realized_pnl = 0.0
+
+    for row in read_events():
+        try:
+            event_date = datetime.fromisoformat(
+                row.get("timestamp", "").replace("Z", "+00:00")
+            ).date()
+        except (TypeError, ValueError):
+            continue
+        if event_date < cutoff:
+            continue
+
+        symbol = row.get("option_symbol", "")
+        key = (row.get("strategy", ""), row.get("underlying", ""), symbol)
+        if row.get("event") == "POSITION_MISSING":
+            inventory.pop(key, None)
+            continue
+        if row.get("event") != "ORDER_FILL" or not symbol:
+            continue
+        if strategy is not None and row.get("strategy", "") != strategy:
+            continue
+
+        qty = float(row.get("qty") or 0)
+        price = float(row.get("price") or 0)
+        lot = inventory.setdefault(key, {"qty": 0.0, "cost": 0.0})
+        if row.get("order_side") == "buy":
+            premium = qty * price * 100
+            lot["qty"] += qty
+            lot["cost"] += premium
+            deployed_premium += premium
+        elif row.get("order_side") == "sell" and lot["qty"] > 0:
+            closed_qty = min(qty, lot["qty"])
+            average_cost = lot["cost"] / lot["qty"]
+            realized_pnl += closed_qty * price * 100 - closed_qty * average_cost
+            lot["qty"] -= closed_qty
+            lot["cost"] -= closed_qty * average_cost
+
+    unrealized_pnl = 0.0
+    positions_value = 0.0
+    open_positions = 0
+    for (_, _, symbol), lot in inventory.items():
+        current = current_prices.get(symbol)
+        if lot["qty"] <= 0:
+            continue
+        open_positions += 1
+        if current is not None:
+            market_value = lot["qty"] * float(current) * 100
+            positions_value += market_value
+            unrealized_pnl += market_value - lot["cost"]
+
+    total_pnl = realized_pnl + unrealized_pnl
+    return_pct = (
+        total_pnl / deployed_premium * 100 if deployed_premium > 0 else 0.0
+    )
+    return {
+        "start_date": cutoff.isoformat(),
+        "deployed_premium": deployed_premium,
+        "realized_pnl": realized_pnl,
+        "unrealized_pnl": unrealized_pnl,
+        "total_pnl": total_pnl,
+        "return_pct": return_pct,
+        "open_positions": open_positions,
+        "positions_value": positions_value,
+    }
+
+
 def build_strategy_report(strategy_names=()):
     """Build fill-based paper performance and open-position details by strategy."""
     events = read_events()

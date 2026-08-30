@@ -50,6 +50,7 @@ from options_trader import (
     buy_option_contract,
     log_open_option_positions,
     log_analytics_summary,
+    log_account_info,
     reconcile_order_fills,
     bootstrap_legacy_positions,
     reconcile_strategy_lots_with_broker,
@@ -70,7 +71,8 @@ def run_bot():
         reconcile_order_fills()
         bootstrap_legacy_positions()
         reconcile_strategy_lots_with_broker()
-        log_open_option_positions()
+        bot_positions = log_open_option_positions()
+        log_account_info(bot_positions)
         log_analytics_summary()
         manage_underlying_exits(
             UNDERLYINGS,
@@ -128,7 +130,12 @@ def run_bot():
                     MACD_SIGNAL,
                     signal=variant["signal"],
                 )
-                if not state["bullish"]:
+                if not state.get("data_available", True):
+                    record_event(
+                        "SKIP", strategy=variant["name"], underlying=underlying,
+                        reason="signal_data_unavailable"
+                    )
+                elif not state["bullish"]:
                     record_event(
                         "SKIP", strategy=variant["name"], underlying=underlying,
                         reason=f"not_bullish_{variant['signal']}"

@@ -1,7 +1,7 @@
 import yfinance as yf
 import ta
 from datetime import date
-from time import monotonic
+from time import monotonic, sleep
 from requests.exceptions import RequestException
 
 from bot_logger import bot_log
@@ -9,6 +9,28 @@ from bot_logger import bot_log
 
 _daily_close_cache = {}
 _DAILY_CLOSE_CACHE_SECONDS = 240
+_DAILY_CLOSE_MAX_STALE_SECONDS = 24 * 60 * 60
+_YAHOO_DOWNLOAD_ATTEMPTS = 3
+
+
+def _download_daily_history(symbol):
+    """Retry transient Yahoo failures before declaring daily data unavailable."""
+    for attempt in range(1, _YAHOO_DOWNLOAD_ATTEMPTS + 1):
+        try:
+            data = yf.download(
+                symbol, period="3y", interval="1d", progress=False,
+                threads=False,
+            )
+            if data is not None and not data.empty:
+                return data
+        except Exception as exc:
+            bot_log(
+                f"Yahoo daily-history attempt {attempt}/{_YAHOO_DOWNLOAD_ATTEMPTS} "
+                f"failed for {symbol}: {exc}"
+            )
+        if attempt < _YAHOO_DOWNLOAD_ATTEMPTS:
+            sleep(attempt)
+    return None
 
 
 def wait_for_market_open(trading_client):
@@ -34,8 +56,11 @@ def _completed_daily_close(symbol):
     cached = _daily_close_cache.get(symbol)
     if cached and monotonic() - cached[0] < _DAILY_CLOSE_CACHE_SECONDS:
         return cached[1]
-    data = yf.download(symbol, period="3y", interval="1d", progress=False)
+    data = _download_daily_history(symbol)
     if data is None or data.empty:
+        if cached and monotonic() - cached[0] <= _DAILY_CLOSE_MAX_STALE_SECONDS:
+            bot_log(f"Using last successful daily history for {symbol}; Yahoo refresh failed.")
+            return cached[1]
         return None
     close = data["Close"].squeeze().dropna()
     if not close.empty and close.index[-1].date() >= date.today():
@@ -105,7 +130,10 @@ def get_bullish_signal_state(
     try:
         close = _completed_daily_close(symbol)
         if close is None or len(close) < ma_long + 5:
-            return {"bullish": False, "new_signal": False, "signal_date": ""}
+            return {
+                "bullish": False, "new_signal": False, "signal_date": "",
+                "data_available": close is not None,
+            }
         indicators = _daily_indicators(
             close, ma_short, ma_long, macd_fast, macd_slow, macd_signal
         )
@@ -115,10 +143,14 @@ def get_bullish_signal_state(
             "bullish": current,
             "new_signal": current and not previous,
             "signal_date": close.index[-1].date().isoformat(),
+            "data_available": True,
         }
     except Exception as exc:
         bot_log(f"Signal-state error for {symbol}: {exc}")
-        return {"bullish": False, "new_signal": False, "signal_date": ""}
+        return {
+            "bullish": False, "new_signal": False, "signal_date": "",
+            "data_available": False,
+        }
 
 
 def is_bullish_setup(

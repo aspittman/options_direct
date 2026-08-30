@@ -42,6 +42,7 @@ from config import (
     OPTION_STOP_LOSS_PERCENT,
     OPTION_TRAILING_STOP_PERCENT,
     PAPER_STRATEGIES,
+    BOT_PERFORMANCE_START_DATE,
     LIMIT_ORDER_TIMEOUT_MINUTES,
     EXIT_LIMIT_TIMEOUT_MINUTES,
     require_alpaca_credentials
@@ -53,6 +54,7 @@ from analytics import (
     get_submitted_orders,
     record_event,
     summarize_results,
+    summarize_performance_since,
 )
 from bot_logger import bot_log
 
@@ -60,6 +62,9 @@ API_KEY, SECRET_KEY = require_alpaca_credentials()
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=ALPACA_PAPER)
 option_data_client = OptionHistoricalDataClient(API_KEY, SECRET_KEY)
 stock_data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
+
+_NON_CORPORATE_UNDERLYINGS = {"SPY", "QQQ", "IWM", "DIA"}
+_earnings_cache = {}
 
 
 def _option_feed():
@@ -176,14 +181,110 @@ def log_analytics_summary():
             )
 
 
+def log_account_info(bot_positions=None):
+    """Log whole-account balances and bot-only position/performance details."""
+    try:
+        account = trading_client.get_account()
+        account_positions = trading_client.get_all_positions()
+        bot_positions = (
+            get_options_direct_positions() if bot_positions is None else bot_positions
+        )
+        bot_market_value = sum(
+            abs(_to_float(getattr(position, "market_value", None)) or 0)
+            for position in bot_positions
+        )
+        account_positions_value = sum(
+            abs(_to_float(getattr(position, "market_value", None)) or 0)
+            for position in account_positions
+        )
+        current_prices = {
+            position.symbol: _to_float(getattr(position, "current_price", None))
+            for position in bot_positions
+        }
+        current_prices = {
+            symbol: price for symbol, price in current_prices.items()
+            if price is not None
+        }
+        performance = summarize_performance_since(
+            BOT_PERFORMANCE_START_DATE, current_prices=current_prices
+        )
+        strategy_performance = {
+            variant["name"]: summarize_performance_since(
+                BOT_PERFORMANCE_START_DATE,
+                current_prices=current_prices,
+                strategy=variant["name"],
+            )
+            for variant in PAPER_STRATEGIES
+        }
+        cash = _to_float(getattr(account, "cash", None)) or 0
+        equity = _to_float(getattr(account, "equity", None)) or 0
+        buying_power = _to_float(getattr(account, "buying_power", None)) or 0
+
+        bot_log("========== ACCOUNT INFO ==========")
+        bot_log(
+            f"ACCOUNT equity=${equity:,.2f} cash=${cash:,.2f} "
+            f"buying_power=${buying_power:,.2f} total_positions={len(account_positions)} "
+            f"positions_value=${account_positions_value:,.2f}"
+        )
+        bot_log(
+            f"OPTIONS_DIRECT positions={len(bot_positions)} "
+            f"positions_value=${bot_market_value:,.2f}"
+        )
+        bot_log(
+            "BOT LIMITS "
+            + " ".join(
+                f"{variant['name']}_per_trade=${(variant['max_premium'] or 0):,.2f}"
+                for variant in PAPER_STRATEGIES
+            )
+            + f" combined_premium_cap=${MAX_TOTAL_OPTION_PREMIUM:,.2f}"
+        )
+        for variant in PAPER_STRATEGIES:
+            name = variant["name"]
+            result = strategy_performance[name]
+            bot_log(
+                f"STRATEGY {name} since={result['start_date']} "
+                f"positions={result['open_positions']} "
+                f"positions_value=${result['positions_value']:,.2f} "
+                f"deployed=${result['deployed_premium']:,.2f} "
+                f"realized=${result['realized_pnl']:,.2f} "
+                f"unrealized=${result['unrealized_pnl']:,.2f} "
+                f"total_pl=${result['total_pnl']:,.2f} "
+                f"gain_loss={result['return_pct']:+.2f}%"
+            )
+        bot_log(
+            f"BOT COMBINED since={performance['start_date']} "
+            f"deployed=${performance['deployed_premium']:,.2f} "
+            f"realized=${performance['realized_pnl']:,.2f} "
+            f"unrealized=${performance['unrealized_pnl']:,.2f} "
+            f"total_pl=${performance['total_pnl']:,.2f} "
+            f"gain_loss={performance['return_pct']:+.2f}%"
+        )
+        bot_log("==================================")
+        return performance
+    except Exception as exc:
+        bot_log(f"Could not log account info: {exc}")
+        return None
+
+
 def has_earnings_soon(underlying, skip_days=EARNINGS_SKIP_DAYS):
     today = date.today()
     last_skip_date = today + timedelta(days=skip_days)
+    symbol = underlying.upper()
+
+    # Broad-market ETFs do not report corporate earnings. Asking Yahoo for an
+    # earnings calendar produces a misleading "possibly delisted" error.
+    if symbol in _NON_CORPORATE_UNDERLYINGS:
+        return False
+
+    cached = _earnings_cache.get((symbol, today, skip_days))
+    if cached is not None:
+        return cached
 
     try:
-        earnings = yf.Ticker(underlying).get_earnings_dates(limit=12)
+        earnings = yf.Ticker(symbol).get_earnings_dates(limit=12)
 
         if earnings is None or earnings.empty:
+            _earnings_cache[(symbol, today, skip_days)] = False
             return False
 
         for earnings_date in earnings.index:
@@ -200,8 +301,10 @@ def has_earnings_soon(underlying, skip_days=EARNINGS_SKIP_DAYS):
                     reason="earnings_soon",
                     details=f"earnings_date={earnings_day}"
                 )
+                _earnings_cache[(symbol, today, skip_days)] = True
                 return True
 
+        _earnings_cache[(symbol, today, skip_days)] = False
         return False
 
     except Exception as e:

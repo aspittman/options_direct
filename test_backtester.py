@@ -3,6 +3,8 @@ from datetime import date
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
+import options_trader
+import strategy
 
 from backtester import apply_portfolio_constraints, build_swing_signals, is_swing_entry_at
 from config import correlation_group
@@ -10,6 +12,7 @@ from analytics import (
     cooldown_active,
     get_underlying_high_water_marks,
     signal_bar_already_submitted,
+    summarize_performance_since,
 )
 from options_trader import (
     calculate_underlying_trailing_stop,
@@ -131,6 +134,22 @@ class CorrelationGroupTests(unittest.TestCase):
 
 
 class EntryGuardTests(unittest.TestCase):
+    def setUp(self):
+        options_trader._earnings_cache.clear()
+
+    @patch("options_trader.yf.Ticker")
+    def test_etf_does_not_request_earnings(self, ticker):
+        self.assertFalse(has_earnings_soon("SPY"))
+        ticker.assert_not_called()
+
+    @patch("options_trader.yf.Ticker")
+    def test_earnings_result_is_cached_for_the_day(self, ticker):
+        ticker.return_value.get_earnings_dates.return_value = pd.DataFrame()
+
+        self.assertFalse(has_earnings_soon("AAPL"))
+        self.assertFalse(has_earnings_soon("AAPL"))
+        ticker.assert_called_once_with("AAPL")
+
     @patch("options_trader.record_event")
     @patch("options_trader.yf.Ticker")
     def test_earnings_check_failure_blocks_entry(self, ticker, record_event):
@@ -143,6 +162,82 @@ class EntryGuardTests(unittest.TestCase):
             reason="earnings_check_failed",
             details="error=ImportError",
         )
+
+
+class YahooHistoryTests(unittest.TestCase):
+    def setUp(self):
+        strategy._daily_close_cache.clear()
+
+    @patch("strategy.sleep")
+    @patch("strategy.yf.download")
+    def test_daily_history_retries_after_empty_response(self, download, sleep):
+        expected = pd.DataFrame({"Close": [100.0]})
+        download.side_effect = [pd.DataFrame(), expected]
+
+        self.assertIs(strategy._download_daily_history("AAPL"), expected)
+        self.assertEqual(download.call_count, 2)
+        sleep.assert_called_once_with(1)
+
+    @patch("strategy._download_daily_history", return_value=None)
+    def test_failed_refresh_uses_last_successful_close(self, download):
+        expected = pd.Series([100.0])
+        strategy._daily_close_cache["AAPL"] = (strategy.monotonic() - 300, expected)
+
+        self.assertIs(strategy._completed_daily_close("AAPL"), expected)
+
+    @patch("strategy._download_daily_history", return_value=None)
+    def test_refresh_does_not_use_overly_stale_close(self, download):
+        strategy._daily_close_cache["AAPL"] = (
+            strategy.monotonic() - strategy._DAILY_CLOSE_MAX_STALE_SECONDS - 1,
+            pd.Series([100.0]),
+        )
+
+        self.assertIsNone(strategy._completed_daily_close("AAPL"))
+
+
+class AnalyticsGuardTests(unittest.TestCase):
+    @patch("analytics.read_events")
+    def test_performance_summary_uses_only_fills_on_or_after_cutoff(self, read_events):
+        read_events.return_value = [
+            {
+                "timestamp": "2026-08-20T12:00:00", "event": "ORDER_FILL",
+                "strategy": "regular", "underlying": "OLD", "option_symbol": "OLD1",
+                "qty": "1", "price": "9", "order_side": "buy",
+            },
+            {
+                "timestamp": "2026-08-21T12:00:00", "event": "ORDER_FILL",
+                "strategy": "regular", "underlying": "AAPL", "option_symbol": "AAPL1",
+                "qty": "1", "price": "2", "order_side": "buy",
+            },
+            {
+                "timestamp": "2026-08-22T12:00:00", "event": "ORDER_FILL",
+                "strategy": "regular", "underlying": "MSFT", "option_symbol": "MSFT1",
+                "qty": "1", "price": "3", "order_side": "buy",
+            },
+            {
+                "timestamp": "2026-08-23T12:00:00", "event": "ORDER_FILL",
+                "strategy": "regular", "underlying": "MSFT", "option_symbol": "MSFT1",
+                "qty": "1", "price": "4", "order_side": "sell",
+            },
+        ]
+
+        result = summarize_performance_since(
+            "2026-08-21", current_prices={"AAPL1": 2.5}
+        )
+
+        self.assertEqual(result["deployed_premium"], 500)
+        self.assertEqual(result["realized_pnl"], 100)
+        self.assertEqual(result["unrealized_pnl"], 50)
+        self.assertEqual(result["total_pnl"], 150)
+        self.assertEqual(result["return_pct"], 30)
+        self.assertEqual(result["open_positions"], 1)
+        self.assertEqual(result["positions_value"], 250)
+
+        regular = summarize_performance_since(
+            "2026-08-21", current_prices={"AAPL1": 2.5}, strategy="regular"
+        )
+        self.assertEqual(regular["deployed_premium"], 500)
+        self.assertEqual(regular["return_pct"], 30)
 
     @patch("analytics.read_events")
     def test_cooldown_counts_trading_days(self, read_events):
