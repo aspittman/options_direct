@@ -182,18 +182,23 @@ class EntryGuardTests(unittest.TestCase):
         )
 
 
-class YahooHistoryTests(unittest.TestCase):
+class AlpacaHistoryTests(unittest.TestCase):
     def setUp(self):
         strategy._daily_close_cache.clear()
 
     @patch("strategy.sleep")
-    @patch("strategy.yf.download")
-    def test_daily_history_retries_after_empty_response(self, download, sleep):
-        expected = pd.DataFrame({"Close": [100.0]})
-        download.side_effect = [pd.DataFrame(), expected]
+    def test_daily_history_retries_after_empty_response(self, sleep):
+        empty = MagicMock(data={"AAPL": []})
+        bar = MagicMock(close=100.0, timestamp=pd.Timestamp("2026-08-31", tz="UTC"))
+        populated = MagicMock(data={"AAPL": [bar]})
+        client = MagicMock()
+        client.get_stock_bars.side_effect = [empty, populated]
+        strategy.configure_daily_data_client(client)
 
-        self.assertIs(strategy._download_daily_history("AAPL"), expected)
-        self.assertEqual(download.call_count, 2)
+        result = strategy._download_daily_history("AAPL")
+
+        self.assertEqual(result["Close"].tolist(), [100.0])
+        self.assertEqual(client.get_stock_bars.call_count, 2)
         sleep.assert_called_once_with(1)
 
     @patch("strategy._download_daily_history", return_value=None)

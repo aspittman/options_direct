@@ -1,34 +1,55 @@
-import yfinance as yf
 import ta
-from datetime import date
+import pandas as pd
+from datetime import date, datetime, timedelta
 from time import monotonic, sleep
 from requests.exceptions import RequestException
+from alpaca.data.enums import DataFeed
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
 
 from bot_logger import bot_log
 
 
 _daily_close_cache = {}
+_stock_data_client = None
 _DAILY_CLOSE_CACHE_SECONDS = 240
 _DAILY_CLOSE_MAX_STALE_SECONDS = 24 * 60 * 60
-_YAHOO_DOWNLOAD_ATTEMPTS = 3
+_ALPACA_DOWNLOAD_ATTEMPTS = 3
+
+
+def configure_daily_data_client(client):
+    """Provide the authenticated Alpaca client used for daily signal bars."""
+    global _stock_data_client
+    _stock_data_client = client
 
 
 def _download_daily_history(symbol):
-    """Retry transient Yahoo failures before declaring daily data unavailable."""
-    for attempt in range(1, _YAHOO_DOWNLOAD_ATTEMPTS + 1):
+    """Retry Alpaca daily bars before declaring signal data unavailable."""
+    if _stock_data_client is None:
+        bot_log(f"Alpaca daily-history client is not configured for {symbol}.")
+        return None
+
+    for attempt in range(1, _ALPACA_DOWNLOAD_ATTEMPTS + 1):
         try:
-            data = yf.download(
-                symbol, period="3y", interval="1d", progress=False,
-                threads=False,
+            request = StockBarsRequest(
+                symbol_or_symbols=symbol,
+                timeframe=TimeFrame.Day,
+                start=datetime.now() - timedelta(days=4 * 365),
+                feed=DataFeed.IEX,
             )
-            if data is not None and not data.empty:
-                return data
+            response = _stock_data_client.get_stock_bars(request)
+            bars = response.data.get(symbol, [])
+            if bars:
+                return pd.DataFrame(
+                    {"Close": [float(bar.close) for bar in bars]},
+                    index=pd.DatetimeIndex([bar.timestamp for bar in bars]),
+                )
         except Exception as exc:
             bot_log(
-                f"Yahoo daily-history attempt {attempt}/{_YAHOO_DOWNLOAD_ATTEMPTS} "
+                f"Alpaca daily-history attempt {attempt}/{_ALPACA_DOWNLOAD_ATTEMPTS} "
                 f"failed for {symbol}: {exc}"
             )
-        if attempt < _YAHOO_DOWNLOAD_ATTEMPTS:
+        if attempt < _ALPACA_DOWNLOAD_ATTEMPTS:
             sleep(attempt)
     return None
 
@@ -59,7 +80,7 @@ def _completed_daily_close(symbol):
     data = _download_daily_history(symbol)
     if data is None or data.empty:
         if cached and monotonic() - cached[0] <= _DAILY_CLOSE_MAX_STALE_SECONDS:
-            bot_log(f"Using last successful daily history for {symbol}; Yahoo refresh failed.")
+            bot_log(f"Using last successful daily history for {symbol}; Alpaca refresh failed.")
             return cached[1]
         return None
     close = data["Close"].squeeze().dropna()
@@ -68,6 +89,14 @@ def _completed_daily_close(symbol):
     result = close if not close.empty else None
     _daily_close_cache[symbol] = (monotonic(), result)
     return result
+
+
+def latest_completed_bar_date(symbol):
+    """Return the date of the newest completed daily bar, if available."""
+    close = _completed_daily_close(symbol)
+    if close is None or close.empty:
+        return None
+    return close.index[-1].date()
 
 
 def _daily_indicators(close, ma_short, ma_long, macd_fast, macd_slow, macd_signal):

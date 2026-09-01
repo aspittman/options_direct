@@ -35,14 +35,17 @@ from analytics import (
 )
 from bot_logger import bot_log, setup_logging
 from strategy import (
+    configure_daily_data_client,
     is_bullish_setup,
     get_bullish_signal_state,
     is_market_regime_bullish,
     is_underlying_exit_signal,
+    latest_completed_bar_date,
     wait_for_market_open
 )
 
 from options_trader import (
+    stock_data_client,
     trading_client,
     has_earnings_soon,
     get_option_contract,
@@ -59,11 +62,13 @@ from options_trader import (
 
 def run_bot():
     setup_logging()
+    configure_daily_data_client(stock_data_client)
     wait_for_market_open(trading_client)
 
     bot_log("Starting options paper trading bot...")
     if not ENABLE_NEW_ENTRIES:
         bot_log("New entries are disabled; existing positions will still be managed.")
+    last_entry_bar_date = None
 
     while True:
         # Re-check every cycle so stale overnight/weekend quotes are not used.
@@ -91,8 +96,28 @@ def run_bot():
 
         if not ENABLE_NEW_ENTRIES:
             record_event("SKIP", reason="new_entries_disabled")
+            bot_log("CYCLE SUMMARY | exits monitored | entry scan disabled")
             time.sleep(SCAN_INTERVAL_SECONDS)
             continue
+
+        entry_bar_date = latest_completed_bar_date(MARKET_REGIME_SYMBOL)
+        if entry_bar_date is None:
+            bot_log("CYCLE SUMMARY | exits monitored | entry scan unavailable: no daily bars")
+            time.sleep(SCAN_INTERVAL_SECONDS)
+            continue
+        if entry_bar_date == last_entry_bar_date:
+            bot_log(
+                f"CYCLE SUMMARY | exits monitored | entry scan not due "
+                f"(last completed bar {entry_bar_date})"
+            )
+            time.sleep(SCAN_INTERVAL_SECONDS)
+            continue
+        last_entry_bar_date = entry_bar_date
+
+        checked = 0
+        new_signals = 0
+        blocked = 0
+        orders_submitted = 0
 
         market_regime_ok = True
         if ENABLE_MARKET_REGIME_FILTER:
@@ -112,11 +137,13 @@ def run_bot():
 
         for underlying in UNDERLYINGS:
             bot_log(f"=== Checking {underlying} ===")
+            checked += 1
 
             if not market_regime_ok:
                 continue
 
             if has_earnings_soon(underlying):
+                blocked += 1
                 continue
 
             eligible_variants = []
@@ -164,6 +191,8 @@ def run_bot():
                 else:
                     eligible_variants.append((variant, state["signal_date"]))
 
+            new_signals += len(eligible_variants)
+
             if not eligible_variants:
                 bot_log(f"No daily bullish setup for {underlying}.")
                 continue
@@ -200,6 +229,7 @@ def run_bot():
                             "SKIP", strategy=strategy_name, underlying=underlying,
                             reason="max_positions"
                         )
+                        blocked += 1
                         continue
                     target_group = correlation_group(underlying)
                     if reserved_group_counts.get(target_group, 0) >= MAX_POSITIONS_PER_CORRELATION_GROUP:
@@ -211,6 +241,7 @@ def run_bot():
                             "SKIP", strategy=strategy_name, underlying=underlying,
                             reason=f"correlation_group_{target_group}"
                         )
+                        blocked += 1
                         continue
                     already_holds = any(
                         strategy == strategy_name and lot_underlying == underlying
@@ -221,6 +252,7 @@ def run_bot():
                             "SKIP", strategy=strategy_name, underlying=underlying,
                             reason="already_holding"
                         )
+                        blocked += 1
                         continue
                     submitted = buy_option_contract(
                         option_symbol,
@@ -231,13 +263,23 @@ def run_bot():
                         signal_date=signal_date,
                     )
                     if submitted:
+                        orders_submitted += 1
                         reserved_count += 1
                         reserved_group_counts[target_group] = (
                             reserved_group_counts.get(target_group, 0) + 1
                         )
+                    else:
+                        blocked += 1
+            else:
+                blocked += len(eligible_variants)
 
             time.sleep(2)
 
+        bot_log(
+            f"CYCLE SUMMARY | daily bar={entry_bar_date} | symbols checked={checked} | "
+            f"new signals={new_signals} | blocked={blocked} | "
+            f"orders submitted={orders_submitted}"
+        )
         time.sleep(SCAN_INTERVAL_SECONDS)
 
 

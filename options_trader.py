@@ -350,16 +350,7 @@ def get_underlying_price(underlying):
     except Exception as e:
         bot_log(f"Could not get Alpaca latest trade for {underlying}: {e}")
 
-    try:
-        data = yf.download(underlying, period="5d", interval="1d", progress=False)
-        if data is None or data.empty:
-            return None
-
-        return float(data["Close"].squeeze().iloc[-1])
-
-    except Exception as e:
-        bot_log(f"Could not get Yahoo price for {underlying}: {e}")
-        return None
+    return None
 
 
 def get_option_volumes(symbols):

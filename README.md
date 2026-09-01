@@ -77,6 +77,10 @@ after an exit. Entries use midpoint day-limit prices and are canceled if they
 remain unfilled for 15 minutes. Risk exits use marketable limits at the current
 bid and are repriced after two minutes if necessary.
 
+Live daily candles come from Alpaca's IEX stock feed. Entry signals are evaluated
+once for each newly completed daily candle; the five-minute runtime loop continues
+to reconcile orders and monitor exits. Each loop ends with a concise cycle summary.
+
 Both variants cap entry premium at $500. Across the two variants, at most two
 positions and $1,000 of entry premium may be open. All contracts are closed by 30
 DTE, and the 30% option stop is catastrophe protection in addition to the
