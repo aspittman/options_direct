@@ -181,6 +181,19 @@ def log_analytics_summary():
             )
 
 
+def _performance_table_row(label, premium_limit, result):
+    """Format one human-readable row of the terminal performance summary."""
+    limit = f"${premium_limit:,.0f}" if premium_limit is not None else "--"
+    return (
+        f"{label:<20} {limit:>11} "
+        f"${result['deployed_premium']:>11,.2f} "
+        f"${result['realized_pnl']:>10,.2f} "
+        f"${result['unrealized_pnl']:>10,.2f} "
+        f"${result['total_pnl']:>10,.2f} "
+        f"{result['return_pct']:>+9.2f}%"
+    )
+
+
 def log_account_info(bot_positions=None):
     """Log whole-account balances and bot-only position/performance details."""
     try:
@@ -220,46 +233,48 @@ def log_account_info(bot_positions=None):
         equity = _to_float(getattr(account, "equity", None)) or 0
         buying_power = _to_float(getattr(account, "buying_power", None)) or 0
 
-        bot_log("========== ACCOUNT INFO ==========")
+        bot_log("================ ACCOUNT & BOT PERFORMANCE ================")
         bot_log(
-            f"ACCOUNT equity=${equity:,.2f} cash=${cash:,.2f} "
-            f"buying_power=${buying_power:,.2f} total_positions={len(account_positions)} "
-            f"positions_value=${account_positions_value:,.2f}"
+            f"ACCOUNT  Equity: ${equity:,.2f}  |  Cash: ${cash:,.2f}  |  "
+            f"Buying power: ${buying_power:,.2f}"
         )
         bot_log(
-            f"OPTIONS_DIRECT positions={len(bot_positions)} "
-            f"positions_value=${bot_market_value:,.2f}"
+            f"POSITIONS  Account: {len(account_positions)} (${account_positions_value:,.2f})  |  "
+            f"OptionsDirect: {len(bot_positions)} (${bot_market_value:,.2f})"
         )
         bot_log(
-            "BOT LIMITS "
-            + " ".join(
-                f"{variant['name']}_per_trade=${(variant['max_premium'] or 0):,.2f}"
+            "LIMITS  "
+            + "  |  ".join(
+                f"{variant['name']}: ${(variant['max_premium'] or 0):,.0f}/trade"
                 for variant in PAPER_STRATEGIES
             )
-            + f" combined_premium_cap=${MAX_TOTAL_OPTION_PREMIUM:,.2f}"
+            + f"  |  Combined open premium: ${MAX_TOTAL_OPTION_PREMIUM:,.0f}"
         )
+        bot_log("-" * 112)
+        bot_log(
+            f"{'PERFORMANCE':<20} {'TRADE CAP':>11} {'DEPLOYED':>12} "
+            f"{'REALIZED':>11} {'UNREALIZED':>11} {'TOTAL P/L':>11} {'GAIN/LOSS':>10}"
+        )
+        bot_log("-" * 112)
         for variant in PAPER_STRATEGIES:
             name = variant["name"]
             result = strategy_performance[name]
             bot_log(
-                f"STRATEGY {name} since={result['start_date']} "
-                f"positions={result['open_positions']} "
-                f"positions_value=${result['positions_value']:,.2f} "
-                f"deployed=${result['deployed_premium']:,.2f} "
-                f"realized=${result['realized_pnl']:,.2f} "
-                f"unrealized=${result['unrealized_pnl']:,.2f} "
-                f"total_pl=${result['total_pnl']:,.2f} "
-                f"gain_loss={result['return_pct']:+.2f}%"
+                _performance_table_row(
+                    name, variant["max_premium"], result
+                )
+                + f"  ({result['open_positions']} open)"
             )
         bot_log(
-            f"BOT COMBINED since={performance['start_date']} "
-            f"deployed=${performance['deployed_premium']:,.2f} "
-            f"realized=${performance['realized_pnl']:,.2f} "
-            f"unrealized=${performance['unrealized_pnl']:,.2f} "
-            f"total_pl=${performance['total_pnl']:,.2f} "
-            f"gain_loss={performance['return_pct']:+.2f}%"
+            _performance_table_row(
+                "COMBINED PORTFOLIO", MAX_TOTAL_OPTION_PREMIUM, performance
+            )
         )
-        bot_log("==================================")
+        bot_log(
+            f"Period starts {performance['start_date']}. Gain/loss is total P/L "
+            "divided by premium deployed."
+        )
+        bot_log("===========================================================")
         return performance
     except Exception as exc:
         bot_log(f"Could not log account info: {exc}")

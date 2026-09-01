@@ -31,6 +31,24 @@ def trade(symbol, entry_date, exit_date, entry_price, exit_price):
     }
 
 
+class TerminalSummaryTests(unittest.TestCase):
+    def test_performance_row_shows_trade_cap_and_signed_gain_loss(self):
+        result = {
+            "deployed_premium": 500,
+            "realized_pnl": 75,
+            "unrealized_pnl": -25,
+            "total_pnl": 50,
+            "return_pct": 10,
+        }
+
+        row = options_trader._performance_table_row("regular", 500, result)
+
+        self.assertIn("regular", row)
+        self.assertIn("$500", row)
+        self.assertIn("$     50.00", row)
+        self.assertIn("+10.00%", row)
+
+
 class PortfolioConstraintTests(unittest.TestCase):
     def test_allows_two_concurrent_positions_and_rejects_third(self):
         candidates = [
