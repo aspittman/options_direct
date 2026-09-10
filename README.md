@@ -39,13 +39,13 @@ UNDERLYING_TRAILING_STOP_PERCENT=0.03
 REENTRY_COOLDOWN_DAYS=5
 LIMIT_ORDER_TIMEOUT_MINUTES=15
 EXIT_LIMIT_TIMEOUT_MINUTES=2
-MAX_PREMIUM_PER_TRADE=500
-REGULAR_MAX_PREMIUM_PER_TRADE=500
-MAX_100_PREMIUM_PER_TRADE=500
+VIRTUAL_STARTING_CAPITAL=25000
+MAX_OPTION_PREMIUM_PER_TRADE=500
+MAX_CONTRACTS_PER_TRADE=1
 MAX_TOTAL_OPTION_PREMIUM=1000
 MAX_POSITIONS=2
 MAX_POSITIONS_PER_CORRELATION_GROUP=1
-BACKTEST_STARTING_CASH=2500
+BACKTEST_STARTING_CASH=25000
 ALLOW_DUPLICATE_CONTRACTS=false
 ALLOW_MULTIPLE_CONTRACTS_PER_UNDERLYING=false
 ```
@@ -60,6 +60,12 @@ only to option contracts submitted by OptionsDirect; stock positions and other
 bots' positions are excluded. The analytics CSV records realized and unrealized
 P/L in separate columns and the cycle log reports results both by contract and
 by underlying.
+
+This repository identifies itself as `long_call` in logs and Alpaca client order
+IDs. It only adopts and manages positive-quantity call positions recorded in its
+own ledger. Account equity and buying power never increase its limits: research
+returns use an independent $25,000 virtual allocation, and long-call capital
+employed is the premium paid.
 
 The live paper bot runs two named daily variants in the same Alpaca paper account.
 Both use completed daily candles and 60–90 DTE calls, so the live and historical
@@ -93,12 +99,19 @@ group (broad indexes, technology, financials, energy, healthcare, and
 consumer/industrial), preventing both slots from expressing essentially the same
 sector bet.
 
+Contract quality is decided before price is tested. The bot first applies DTE,
+delta, liquidity, and spread rules, ranks the surviving contracts, and then checks
+the preferred contract's total premium. If it costs more than $500, the opportunity
+is rejected; the bot does not substitute a cheaper far-OTM contract. Signal-qualified
+rejections are written to `logs/rejected_trades.csv` with standardized reasons and
+available quote, contract, capital, and regime context.
+
 Both variants submit separately tagged paper orders. Alpaca combines quantities
 when both variants own the same contract, while `logs/trade_analytics.csv` keeps
 the confirmed fill price and virtual quantity for each variant. Runtime summaries
 include `by_strategy` realized and unrealized P/L based on those paper fills.
-Changing `MAX_PREMIUM_PER_TRADE` is retained for compatibility with older setups;
-the two live variants use the two strategy-specific settings above.
+Older premium variable names remain code-level compatibility aliases; the two live
+variants use `MAX_OPTION_PREMIUM_PER_TRADE`.
 
 Run the options backtester:
 
@@ -106,6 +119,10 @@ Run the options backtester:
 python backtester.py --years 1
 python backtester.py --years 3
 python backtester.py --years 5
+python backtester.py --years 5 --max-option-premium 250
+python backtester.py --years 5 --max-option-premium 500
+python backtester.py --years 5 --max-option-premium 750
+python backtester.py --years 5 --max-option-premium 1000
 python backtester.py --years 5 --compare-signals
 python backtester.py --years 2 --alpaca-options swing --max-candidates 100
 ```
@@ -127,6 +144,11 @@ are written to `logs/options_backtest_trades.csv` and
 `logs/options_backtest_trades_100_max.csv` and
 `logs/options_backtest_equity_curve_100_max.csv`. Each summary includes win rate,
 total P/L, profit factor, expectancy, maximum drawdown, and symbol-level results.
+It also reports qualified signals, executed trades, capital-only rejection counts,
+virtual-capital return, return on premium employed, average and maximum capital
+employed, average premium/DTE/hold time, and winner/loss statistics. Synthetic
+backtests cannot measure historical spread or liquidity; use `--alpaca-options`
+for actual option-bar validation from February 2024 onward.
 Historical backtests remain separate from live paper analytics: they provide many
 years of fast, estimated testing, while the live analytics file measures the
 actual fills returned by Alpaca paper trading from this point forward.

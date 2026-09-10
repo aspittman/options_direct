@@ -92,18 +92,23 @@ class AlpacaOptionRepricer:
             entry_start,
             entry_start + timedelta(days=2),
         )
-        eligible = []
+        selected = None
         for contract in contracts:
             bars = entry_bars.get(contract.symbol, [])
             if not bars:
                 continue
             entry_price = float(bars[0].close)
-            if 0 < entry_price * 100 <= max_entry_premium:
-                eligible.append((contract, entry_price))
-        if not eligible:
+            if entry_price > 0:
+                selected = (contract, entry_price)
+                break
+        if selected is None:
             return None
 
-        contract, entry_price = eligible[0]
+        # Budget is a final accept/reject gate. Never move to an inferior strike
+        # merely because the strategy-preferred contract is cheaper.
+        contract, entry_price = selected
+        if entry_price * 100 > max_entry_premium:
+            return None
         exit_end = _utc_start(candidate["exit_date"]) + timedelta(days=2)
         history = self._bars([contract.symbol], entry_start, exit_end).get(
             contract.symbol, []

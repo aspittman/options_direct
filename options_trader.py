@@ -39,6 +39,10 @@ from config import (
     ALLOW_MULTIPLE_CONTRACTS_PER_UNDERLYING,
     EXIT_DTE,
     MAX_TOTAL_OPTION_PREMIUM,
+    MAX_OPTION_PREMIUM_PER_TRADE,
+    MAX_CONTRACTS_PER_TRADE,
+    VIRTUAL_STARTING_CAPITAL,
+    BOT_STRATEGY_ID,
     OPTION_STOP_LOSS_PERCENT,
     OPTION_TRAILING_STOP_PERCENT,
     PAPER_STRATEGIES,
@@ -52,7 +56,9 @@ from analytics import (
     get_strategy_open_lots,
     get_underlying_high_water_marks,
     get_submitted_orders,
+    get_virtual_cash_available,
     record_event,
+    record_rejected_trade,
     summarize_results,
     summarize_performance_since,
 )
@@ -114,7 +120,12 @@ def get_options_direct_positions():
         owned = get_owned_option_symbols()
         return [
             position for position in trading_client.get_all_positions()
-            if position.symbol in owned and parse_option_symbol(position.symbol)
+            if (
+                position.symbol in owned
+                and parse_option_symbol(position.symbol)
+                and parse_option_symbol(position.symbol)["option_type"] == "call"
+                and (_to_float(getattr(position, "qty", None)) or 0) > 0
+            )
         ]
     except Exception as e:
         bot_log(f"Could not retrieve OptionsDirect positions: {e}")
@@ -243,7 +254,7 @@ def log_account_info(bot_positions=None):
             f"OptionsDirect: {len(bot_positions)} (${bot_market_value:,.2f})"
         )
         bot_log(
-            "LIMITS  "
+            f"LIMITS  Virtual capital: ${VIRTUAL_STARTING_CAPITAL:,.0f}  |  "
             + "  |  ".join(
                 f"{variant['name']}: ${(variant['max_premium'] or 0):,.0f}/trade"
                 for variant in PAPER_STRATEGIES
@@ -271,8 +282,15 @@ def log_account_info(bot_positions=None):
             )
         )
         bot_log(
-            f"Period starts {performance['start_date']}. Gain/loss is total P/L "
-            "divided by premium deployed."
+            f"LONG CALL RESEARCH  ending=${performance['ending_virtual_capital']:,.2f} | "
+            f"ROC employed={performance['return_on_capital_employed']:+.2f}% | "
+            f"trades={performance['trade_count']} | win rate={performance['win_rate']:.2%} | "
+            f"profit factor={performance['profit_factor']:.2f} | "
+            f"max drawdown=${performance['max_drawdown']:,.2f}"
+        )
+        bot_log(
+            f"Period starts {performance['start_date']}. Gain/loss uses the "
+            f"${VIRTUAL_STARTING_CAPITAL:,.0f} virtual allocation; capital employed is premium paid."
         )
         bot_log("===========================================================")
         return performance
@@ -433,7 +451,18 @@ def contract_score(contract, snapshot, volume, underlying_price):
     )
 
 
-def get_option_contract(underlying, option_type="call", min_dte=30, max_dte=60):
+def _record_contract_rejections(strategies, reason, underlying, **fields):
+    for strategy in strategies or ("",):
+        record_rejected_trade(
+            reason, strategy=strategy, underlying=underlying,
+            call_or_put="call", long_or_short="long", **fields
+        )
+
+
+def get_option_contract(
+    underlying, option_type="call", min_dte=30, max_dte=60,
+    strategies=(), market_regime="bullish",
+):
     today = date.today()
     min_exp = today + timedelta(days=min_dte)
     max_exp = today + timedelta(days=max_dte)
@@ -442,6 +471,10 @@ def get_option_contract(underlying, option_type="call", min_dte=30, max_dte=60):
     if not underlying_price:
         bot_log(f"Could not determine underlying price for {underlying}")
         record_event("SKIP", underlying=underlying, reason="missing_underlying_price")
+        _record_contract_rejections(
+            strategies, "NO_VALID_CONTRACT", underlying,
+            market_regime=market_regime,
+        )
         return None
 
     contract_type = ContractType.CALL if option_type == "call" else ContractType.PUT
@@ -480,11 +513,19 @@ def get_option_contract(underlying, option_type="call", min_dte=30, max_dte=60):
             reason="contract_lookup_failed",
             details=str(e)
         )
+        _record_contract_rejections(
+            strategies, "NO_VALID_CONTRACT", underlying,
+            underlying_price=underlying_price, market_regime=market_regime,
+        )
         return None
 
     if not contracts:
         bot_log(f"No option contracts found for {underlying}")
         record_event("SKIP", underlying=underlying, reason="no_contracts")
+        _record_contract_rejections(
+            strategies, "NO_VALID_CONTRACT", underlying,
+            underlying_price=underlying_price, market_regime=market_regime,
+        )
         return None
 
     contracts = [
@@ -498,12 +539,19 @@ def get_option_contract(underlying, option_type="call", min_dte=30, max_dte=60):
     if not contracts:
         bot_log(f"No {underlying} contracts passed open interest > {MIN_OPEN_INTEREST}")
         record_event("SKIP", underlying=underlying, reason="open_interest_filter")
+        _record_contract_rejections(
+            strategies, "INSUFFICIENT_LIQUIDITY", underlying,
+            underlying_price=underlying_price, market_regime=market_regime,
+        )
         return None
 
     symbols = [contract.symbol for contract in contracts]
     snapshots = get_option_snapshots(symbols)
     volumes = get_option_volumes(symbols)
     ranked = []
+    rejected_candidates = []
+    liquid_snapshots = 0
+    spread_failures = 0
 
     for contract in contracts:
         volume = volumes.get(contract.symbol, 0)
@@ -513,6 +561,17 @@ def get_option_contract(underlying, option_type="call", min_dte=30, max_dte=60):
         snapshot = snapshots.get(contract.symbol)
         if snapshot is None:
             continue
+
+        liquid_snapshots += 1
+        quote = getattr(snapshot, "latest_quote", None)
+        spread = bid_ask_spread_pct(quote)
+        if spread is None or spread >= MAX_BID_ASK_SPREAD_PCT:
+            spread_failures += 1
+        delta = _to_float(getattr(getattr(snapshot, "greeks", None), "delta", None))
+        rejected_candidates.append((
+            abs(delta - TARGET_DELTA) if delta is not None else float("inf"),
+            contract, quote, spread,
+        ))
 
         score = contract_score(contract, snapshot, volume, underlying_price)
         if score is None:
@@ -535,6 +594,40 @@ def get_option_contract(underlying, option_type="call", min_dte=30, max_dte=60):
                 f"target_delta={TARGET_DELTA};"
                 f"delta_tolerance={DELTA_TOLERANCE}"
             )
+        )
+        rejection_reason = (
+            "INSUFFICIENT_LIQUIDITY" if liquid_snapshots == 0
+            else "SPREAD_TOO_WIDE" if spread_failures == liquid_snapshots
+            else "NO_VALID_CONTRACT"
+        )
+        fields = {
+            "underlying_price": underlying_price,
+            "market_regime": market_regime,
+            "virtual_capital_available": get_virtual_cash_available(),
+        }
+        if rejected_candidates:
+            _, candidate, quote, spread = min(rejected_candidates, key=lambda item: item[0])
+            candidate_bid = _to_float(getattr(quote, "bid_price", None)) or 0
+            candidate_ask = _to_float(getattr(quote, "ask_price", None)) or 0
+            candidate_mid = (
+                (candidate_bid + candidate_ask) / 2
+                if candidate_bid > 0 and candidate_ask > 0 else 0
+            )
+            fields.update({
+                "contract_symbol": candidate.symbol,
+                "strike": candidate.strike_price,
+                "expiration": candidate.expiration_date,
+                "dte": (candidate.expiration_date - today).days,
+                "bid": candidate_bid,
+                "ask": candidate_ask,
+                "mid": candidate_mid,
+                "spread_dollars": candidate_ask - candidate_bid,
+                "spread_percent": spread if spread is not None else "",
+                "option_premium": candidate_mid * CONTRACT_MULTIPLIER,
+                "required_capital": candidate_mid * CONTRACT_MULTIPLIER,
+            })
+        _record_contract_rejections(
+            strategies, rejection_reason, underlying, **fields
         )
         return None
 
@@ -738,10 +831,28 @@ def buy_option_contract(
         lot_strategy == strategy and symbol == option_symbol
         for lot_strategy, _, symbol in strategy_lots
     )
+    if qty > MAX_CONTRACTS_PER_TRADE:
+        bot_log(
+            f"Contract limit blocked strategy={strategy} {option_symbol}: "
+            f"qty={qty}, limit={MAX_CONTRACTS_PER_TRADE}"
+        )
+        record_rejected_trade(
+            "MAX_CONTRACTS_REACHED", strategy=strategy, underlying=underlying,
+            contract_symbol=option_symbol,
+            strike=parsed["strike"] if parsed else "",
+            expiration=parsed["expiration"] if parsed else "",
+            dte=(parsed["expiration"] - date.today()).days if parsed else "",
+            required_capital="", virtual_capital_available=get_virtual_cash_available(),
+        )
+        return False
     if strategy_holds_symbol or _strategy_has_pending_order(strategy, option_symbol, "buy"):
         bot_log(f"Duplicate contract blocked: {option_symbol}")
         record_event("SKIP", strategy=strategy, underlying=underlying, option_symbol=option_symbol, reason="duplicate_contract")
-        return
+        record_rejected_trade(
+            "DUPLICATE_POSITION", strategy=strategy, underlying=underlying,
+            contract_symbol=option_symbol,
+        )
+        return False
     if (
         not ALLOW_MULTIPLE_CONTRACTS_PER_UNDERLYING
         and parsed
@@ -750,7 +861,11 @@ def buy_option_contract(
     ):
         bot_log(f"Additional contract for strategy={strategy} {underlying} blocked by configuration.")
         record_event("SKIP", strategy=strategy, underlying=underlying, option_symbol=option_symbol, reason="multiple_underlying_contracts")
-        return
+        record_rejected_trade(
+            "DUPLICATE_POSITION", strategy=strategy, underlying=underlying,
+            contract_symbol=option_symbol,
+        )
+        return False
 
     snapshots = get_option_snapshots([option_symbol])
     snapshot = snapshots.get(option_symbol)
@@ -759,6 +874,12 @@ def buy_option_contract(
     ask = _to_float(getattr(quote, "ask_price", None)) or 0
     estimated_price = (bid + ask) / 2 if bid > 0 and ask > 0 else ask
     estimated_premium = estimated_price * qty * CONTRACT_MULTIPLIER
+    spread_dollars = ask - bid if bid > 0 and ask >= bid else ""
+    spread_pct = (
+        spread_dollars / estimated_price
+        if spread_dollars != "" and estimated_price > 0 else ""
+    )
+    virtual_cash_available = get_virtual_cash_available()
     current_total = sum(
         (_to_float(getattr(p, "avg_entry_price", None)) or 0)
         * abs(_to_float(getattr(p, "qty", None)) or 0) * CONTRACT_MULTIPLIER
@@ -767,15 +888,55 @@ def buy_option_contract(
     if estimated_premium <= 0:
         bot_log(f"Cannot price {option_symbol} for premium risk checks. Skipping.")
         record_event("SKIP", underlying=underlying, option_symbol=option_symbol, reason="missing_option_price")
-        return
-    if max_entry_premium is not None and estimated_premium > max_entry_premium:
-        bot_log(f"Premium limit blocked strategy={strategy} {option_symbol}: estimated=${estimated_premium:.2f}, limit=${max_entry_premium:.2f}")
-        record_event("SKIP", strategy=strategy, underlying=underlying, option_symbol=option_symbol, reason="max_premium_per_trade", details=f"estimated_premium={estimated_premium:.2f};limit={max_entry_premium:.2f}")
-        return
+        record_rejected_trade(
+            "NO_VALID_CONTRACT", strategy=strategy, underlying=underlying,
+            contract_symbol=option_symbol, bid=bid, ask=ask,
+            virtual_capital_available=virtual_cash_available,
+        )
+        return False
+    premium_limit = min(
+        MAX_OPTION_PREMIUM_PER_TRADE,
+        max_entry_premium if max_entry_premium is not None else MAX_OPTION_PREMIUM_PER_TRADE,
+    )
+    if estimated_premium > premium_limit:
+        bot_log(f"Premium limit blocked strategy={strategy} {option_symbol}: estimated=${estimated_premium:.2f}, limit=${premium_limit:.2f}")
+        record_event("SKIP", strategy=strategy, underlying=underlying, option_symbol=option_symbol, reason="max_premium_per_trade", details=f"estimated_premium={estimated_premium:.2f};limit={premium_limit:.2f}")
+        record_rejected_trade(
+            "PREMIUM_OVER_LIMIT", strategy=strategy, underlying=underlying,
+            contract_symbol=option_symbol, strike=parsed["strike"] if parsed else "",
+            expiration=parsed["expiration"] if parsed else "",
+            dte=(parsed["expiration"] - date.today()).days if parsed else "",
+            underlying_price=get_underlying_price(underlying) or "",
+            bid=bid, ask=ask, mid=estimated_price, spread_dollars=spread_dollars,
+            spread_percent=spread_pct, option_premium=estimated_premium,
+            required_capital=estimated_premium,
+            virtual_capital_available=virtual_cash_available,
+            market_regime="bullish",
+        )
+        return False
+    if estimated_premium > virtual_cash_available:
+        bot_log(
+            f"Virtual capital blocked {option_symbol}: required=${estimated_premium:.2f}, "
+            f"available=${virtual_cash_available:.2f}"
+        )
+        record_rejected_trade(
+            "MAX_STRATEGY_EXPOSURE_REACHED", strategy=strategy,
+            underlying=underlying, contract_symbol=option_symbol,
+            option_premium=estimated_premium, required_capital=estimated_premium,
+            virtual_capital_available=virtual_cash_available,
+        )
+        return False
     if current_total + estimated_premium > MAX_TOTAL_OPTION_PREMIUM:
         bot_log(f"Total premium limit blocked {option_symbol}: current=${current_total:.2f}, proposed=${estimated_premium:.2f}, MAX_TOTAL_OPTION_PREMIUM=${MAX_TOTAL_OPTION_PREMIUM:.2f}")
         record_event("SKIP", underlying=underlying, option_symbol=option_symbol, reason="max_total_option_premium")
-        return
+        record_rejected_trade(
+            "MAX_STRATEGY_EXPOSURE_REACHED", strategy=strategy,
+            underlying=underlying, contract_symbol=option_symbol,
+            option_premium=estimated_premium,
+            required_capital=current_total + estimated_premium,
+            virtual_capital_available=virtual_cash_available,
+        )
+        return False
 
     limit_price = round(estimated_price, 2)
     order = LimitOrderRequest(
@@ -784,7 +945,9 @@ def buy_option_contract(
         side=OrderSide.BUY,
         time_in_force=TimeInForce.DAY,
         limit_price=limit_price,
-        client_order_id=f"od-{strategy}-{int(datetime.now().timestamp() * 1000)}"
+        client_order_id=(
+            f"{BOT_STRATEGY_ID}_{underlying}_{int(datetime.now().timestamp() * 1000)}"
+        )
     )
 
     try:
@@ -804,7 +967,9 @@ def buy_option_contract(
             order_status=str(getattr(submitted_order, "status", "")),
             details=(f"order_id={getattr(submitted_order, 'id', '')};"
                      f"underlying_price={underlying_price};estimated_premium={estimated_premium:.2f};"
-                     f"signal_date={signal_date};limit_price={limit_price:.2f}")
+                     f"signal_date={signal_date};limit_price={limit_price:.2f};"
+                     f"dte={(parsed['expiration'] - date.today()).days if parsed else ''};"
+                     f"spread_pct={spread_pct}")
         )
         return True
 
@@ -812,11 +977,18 @@ def buy_option_contract(
         bot_log(f"Option order failed: {e}")
         record_event(
             "ORDER_FAILED",
+            strategy=strategy,
             underlying=underlying,
             option_symbol=option_symbol,
             qty=qty,
             reason="buy_failed",
             details=str(e)
+        )
+        record_rejected_trade(
+            "OTHER", strategy=strategy, underlying=underlying,
+            contract_symbol=option_symbol, option_premium=estimated_premium,
+            required_capital=estimated_premium,
+            virtual_capital_available=virtual_cash_available,
         )
         return False
 
@@ -891,7 +1063,9 @@ def close_strategy_lot(strategy, underlying, option_symbol, qty, reason):
         side=OrderSide.SELL,
         time_in_force=TimeInForce.DAY,
         limit_price=limit_price,
-        client_order_id=f"od-{strategy}-x-{int(datetime.now().timestamp() * 1000)}",
+        client_order_id=(
+            f"{BOT_STRATEGY_ID}_{underlying}_x_{int(datetime.now().timestamp() * 1000)}"
+        ),
     )
     try:
         submitted = trading_client.submit_order(order)

@@ -1,6 +1,7 @@
 import argparse
 import csv
 import math
+from datetime import date
 from pathlib import Path
 
 import ta
@@ -10,6 +11,7 @@ from config import (
     BACKTEST_ENTRY_DTE,
     BACKTEST_OPTION_TIME_VALUE_PERCENT,
     BACKTEST_STARTING_CASH,
+    BOT_PERFORMANCE_START_DATE,
     MACD_FAST,
     MACD_SIGNAL,
     MACD_SLOW,
@@ -24,9 +26,9 @@ from config import (
     PAPER_STRATEGIES,
     MAX_POSITIONS,
     MAX_TOTAL_OPTION_PREMIUM,
-    REGULAR_MAX_PREMIUM_PER_TRADE,
-    MAX_100_PREMIUM_PER_TRADE,
     MAX_POSITIONS_PER_CORRELATION_GROUP,
+    MAX_OPTION_PREMIUM_PER_TRADE,
+    VIRTUAL_STARTING_CAPITAL,
     correlation_group,
 )
 
@@ -36,7 +38,6 @@ EQUITY_CURVE_FILE = Path("logs/options_backtest_equity_curve.csv")
 CHEAP_RESULTS_FILE = Path("logs/options_backtest_trades_100_max.csv")
 CHEAP_EQUITY_CURVE_FILE = Path("logs/options_backtest_equity_curve_100_max.csv")
 CONTRACT_MULTIPLIER = 100
-CHEAP_MAX_PREMIUM = MAX_100_PREMIUM_PER_TRADE
 YEARS_TO_PERIOD = {1: "1y", 3: "3y", 5: "5y"}
 
 FIELDNAMES = [
@@ -70,6 +71,7 @@ def apply_portfolio_constraints(
     max_total_premium=MAX_TOTAL_OPTION_PREMIUM,
     max_entry_premium=None,
     max_positions_per_group=MAX_POSITIONS_PER_CORRELATION_GROUP,
+    rejection_counts=None,
 ):
     """Select affordable trades chronologically and enforce portfolio exposure.
 
@@ -97,16 +99,24 @@ def apply_portfolio_constraints(
             for position in active
         )
         if max_entry_premium is not None and premium > max_entry_premium:
+            if rejection_counts is not None:
+                rejection_counts["premium_over_limit"] += 1
             continue
         if len(active) >= max_positions:
+            if rejection_counts is not None:
+                rejection_counts["portfolio_constraints"] += 1
             continue
         group_count = sum(
             1 for position in active
             if correlation_group(position["symbol"]) == correlation_group(trade["symbol"])
         )
         if group_count >= max_positions_per_group:
+            if rejection_counts is not None:
+                rejection_counts["portfolio_constraints"] += 1
             continue
         if premium > cash or deployed + premium > max_total_premium:
+            if rejection_counts is not None:
+                rejection_counts["capital_or_exposure"] += 1
             continue
 
         cash -= premium
@@ -206,11 +216,16 @@ def backtest_underlying_signal(symbol, close, strategy):
 
     for index in range(minimum_bars, len(close)):
         if entry_index is None:
-            enters = (
-                is_bullish_at(close, current_indicators, index)
-                if strategy == "current"
-                else is_swing_entry_at(close, swing_indicators, index)
-            )
+            if strategy == "current":
+                enters = (
+                    is_bullish_at(close, current_indicators, index)
+                    and not is_bullish_at(close, current_indicators, index - 1)
+                )
+            else:
+                enters = (
+                    is_swing_entry_at(close, swing_indicators, index)
+                    and not is_swing_entry_at(close, swing_indicators, index - 1)
+                )
             if enters:
                 entry_index = index
                 underlying_high = float(close.iloc[index])
@@ -270,7 +285,10 @@ def run_signal_comparison(period, interval):
     return results
 
 
-def run_alpaca_option_backtest(period, interval, strategy, max_candidates):
+def run_alpaca_option_backtest(
+    period, interval, strategy, max_candidates,
+    max_option_premium=MAX_OPTION_PREMIUM_PER_TRADE,
+):
     if interval != "1d":
         raise ValueError("Alpaca option validation requires --interval 1d")
     from alpaca_option_backtest import reprice_candidates
@@ -283,12 +301,12 @@ def run_alpaca_option_backtest(period, interval, strategy, max_candidates):
     candidates.sort(key=lambda item: (item["entry_date"], item["symbol"]))
     trades = reprice_candidates(
         candidates,
-        max_entry_premium=100.0,
+        max_entry_premium=max_option_premium,
         max_candidates=max_candidates,
     )
     trades = apply_portfolio_constraints(
         trades,
-        max_entry_premium=100.0,
+        max_entry_premium=max_option_premium,
     )
     print_summary(trades, f"Alpaca Historical Options: {strategy}")
     return trades
@@ -456,7 +474,10 @@ def build_trade(symbol, close, entry_index, exit_index, exit_reason, option_posi
     }
 
 
-def backtest_close(symbol, close, max_entry_premium=None, strategy="current"):
+def backtest_close(
+    symbol, close, max_entry_premium=None, strategy="current",
+    research_counts=None,
+):
     minimum_bars = max(MA_LONG, MACD_SLOW + MACD_SIGNAL) + 5
     if len(close) < minimum_bars:
         print(f"{symbol}: not enough historical data ({len(close)} bars)")
@@ -472,18 +493,24 @@ def backtest_close(symbol, close, max_entry_premium=None, strategy="current"):
 
     for index in range(minimum_bars, len(close)):
         if entry_index is None:
-            enters = (
-                is_swing_entry_at(close, indicators, index)
-                if strategy == "swing"
-                else is_bullish_at(close, indicators, index)
+            signal_func = (
+                is_swing_entry_at if strategy == "swing" else is_bullish_at
+            )
+            # Live entries require a fresh false-to-true completed-bar signal.
+            enters = signal_func(close, indicators, index) and not signal_func(
+                close, indicators, index - 1
             )
             if enters:
+                if research_counts is not None:
+                    research_counts["qualified_signals"] += 1
                 candidate = build_option_position(float(close.iloc[index]))
                 entry_premium = candidate["entry_price"] * CONTRACT_MULTIPLIER
                 if max_entry_premium is None or entry_premium <= max_entry_premium:
                     entry_index = index
                     option_position = candidate
                     underlying_high = float(close.iloc[index])
+                elif research_counts is not None:
+                    research_counts["premium_over_limit"] += 1
             continue
 
         option_entry_price = option_position["entry_price"]
@@ -603,14 +630,43 @@ def max_drawdown(equity_curve):
     return abs(min(float(point["drawdown"]) for point in equity_curve))
 
 
-def print_summary(trades, title="Options Backtest Summary"):
+def maximum_backtest_capital_employed(trades):
+    """Peak concurrent long-call premiums, matching live capital employed."""
+    events = []
+    for trade in trades:
+        premium = float(trade["estimated_option_entry_price"]) * CONTRACT_MULTIPLIER
+        events.append((trade["entry_date"], 1, premium))
+        events.append((trade["exit_date"], 0, -premium))
+    employed = 0.0
+    maximum = 0.0
+    for _, _, change in sorted(events):
+        employed = max(employed + change, 0.0)
+        maximum = max(maximum, employed)
+    return maximum
+
+
+def print_summary(
+    trades, title="Options Backtest Summary",
+    starting_capital=VIRTUAL_STARTING_CAPITAL, research_counts=None,
+):
     print(f"\n{title}")
     print("=" * len(title))
 
     total_trades = len(trades)
+    if research_counts is not None:
+        print(f"Qualified signals: {research_counts['qualified_signals']}")
+        print(f"Executed trades: {total_trades}")
+        print("Rejected:")
+        print(f"  Premium over limit: {research_counts['premium_over_limit']}")
+        print(f"  Capital/exposure: {research_counts['capital_or_exposure']}")
+        print(f"  Position/correlation controls: {research_counts['portfolio_constraints']}")
+        print("  Spread/liquidity: not modeled by synthetic backtest")
     print(f"Total trades: {total_trades}")
 
     if not trades:
+        print(f"Starting virtual capital: ${starting_capital:.2f}")
+        print(f"Ending virtual capital: ${starting_capital:.2f}")
+        print("Total return: 0.00%")
         print("Win rate: 0.00%")
         print("Total P/L: $0.00")
         print("Average win: $0.00")
@@ -634,6 +690,16 @@ def print_summary(trades, title="Options Backtest Summary"):
     gross_loss = abs(sum(losses))
     profit_factor = gross_profit / gross_loss if gross_loss else float("inf")
     expectancy = total_pnl / total_trades
+    premiums = [
+        float(trade["estimated_option_entry_price"]) * CONTRACT_MULTIPLIER
+        for trade in trades
+    ]
+    premium_paid = sum(premiums)
+    hold_days = [
+        (date.fromisoformat(trade["exit_date"]) - date.fromisoformat(trade["entry_date"])).days
+        for trade in trades
+    ]
+    entry_dtes = [float(trade.get("entry_dte") or 0) for trade in trades]
     equity_curve = build_equity_curve(trades)
     maximum_drawdown = max_drawdown(equity_curve)
 
@@ -649,12 +715,26 @@ def print_summary(trades, title="Options Backtest Summary"):
     profit_factor_text = "inf" if profit_factor == float("inf") else f"{profit_factor:.2f}"
 
     print(f"Win rate: {win_rate:.2%}")
+    print(f"Starting virtual capital: ${starting_capital:.2f}")
+    print(f"Ending virtual capital: ${starting_capital + total_pnl:.2f}")
+    print(f"Total return: {total_pnl / starting_capital:.2%}")
     print(f"Total P/L: ${total_pnl:.2f}")
     print(f"Average win: ${average_win:.2f}")
     print(f"Average loss: ${average_loss:.2f}")
     print(f"Profit factor: {profit_factor_text}")
     print(f"Expectancy: ${expectancy:.2f}/trade")
     print(f"Maximum drawdown: ${maximum_drawdown:.2f}")
+    print(f"Premium paid: ${premium_paid:.2f}")
+    print(f"Premium lost: ${abs(sum(losses)):.2f}")
+    print(f"Return on capital employed: {total_pnl / premium_paid:.2%}")
+    print(f"Average capital employed/trade: ${sum(premiums) / len(premiums):.2f}")
+    print(f"Maximum capital employed: ${maximum_backtest_capital_employed(trades):.2f}")
+    print(f"Average hold time: {sum(hold_days) / len(hold_days):.1f} days")
+    print(f"Largest winner: ${max(wins) if wins else 0:.2f}")
+    print(f"Largest loser: ${min(losses) if losses else 0:.2f}")
+    print(f"Average option premium: ${sum(premiums) / len(premiums):.2f}")
+    print(f"Average DTE: {sum(entry_dtes) / len(entry_dtes):.1f}")
+    print("Average spread: not modeled by synthetic backtest")
     print(f"Best symbol: {best_symbol} (${symbol_pnl[best_symbol]:.2f})")
     print(f"Worst symbol: {worst_symbol} (${symbol_pnl[worst_symbol]:.2f})")
     print("Trades by symbol:")
@@ -662,9 +742,20 @@ def print_summary(trades, title="Options Backtest Summary"):
         print(f"  {symbol}: {symbol_counts[symbol]} trades, ${symbol_pnl[symbol]:.2f} P/L")
 
 
-def run_backtest(period, interval):
+def _research_counts():
+    return {
+        "qualified_signals": 0,
+        "premium_over_limit": 0,
+        "capital_or_exposure": 0,
+        "portfolio_constraints": 0,
+    }
+
+
+def run_backtest(period, interval, max_option_premium=MAX_OPTION_PREMIUM_PER_TRADE):
     regular_trades = []
     cheap_trades = []
+    regular_counts = _research_counts()
+    swing_counts = _research_counts()
 
     for symbol in UNDERLYINGS:
         print(f"Backtesting {symbol}...")
@@ -672,18 +763,23 @@ def run_backtest(period, interval):
         if close is None:
             print(f"{symbol}: no historical data")
             continue
-        regular_trades.extend(backtest_close(symbol, close))
+        regular_trades.extend(backtest_close(
+            symbol, close, max_option_premium, research_counts=regular_counts
+        ))
         cheap_trades.extend(backtest_close(
-            symbol, close, CHEAP_MAX_PREMIUM, strategy="swing"
+            symbol, close, max_option_premium, strategy="swing",
+            research_counts=swing_counts,
         ))
 
     regular_trades = apply_portfolio_constraints(
         regular_trades,
-        max_entry_premium=REGULAR_MAX_PREMIUM_PER_TRADE,
+        max_entry_premium=max_option_premium,
+        rejection_counts=regular_counts,
     )
     cheap_trades = apply_portfolio_constraints(
         cheap_trades,
-        max_entry_premium=CHEAP_MAX_PREMIUM,
+        max_entry_premium=max_option_premium,
+        rejection_counts=swing_counts,
     )
     regular_equity_curve = build_equity_curve(regular_trades)
     cheap_equity_curve = build_equity_curve(cheap_trades)
@@ -692,16 +788,22 @@ def run_backtest(period, interval):
     save_trades(cheap_trades, CHEAP_RESULTS_FILE)
     save_equity_curve(cheap_equity_curve, CHEAP_EQUITY_CURVE_FILE)
 
-    print_summary(regular_trades, "Regular Options Backtest Summary")
-    print_summary(cheap_trades, f"${CHEAP_MAX_PREMIUM:g} Daily Swing Backtest Summary")
+    print_summary(
+        regular_trades, "Regular Options Backtest Summary",
+        research_counts=regular_counts,
+    )
+    print_summary(
+        cheap_trades, f"${max_option_premium:g} Daily Swing Backtest Summary",
+        research_counts=swing_counts,
+    )
     print(f"\nSaved regular trades to {RESULTS_FILE}")
     print(f"Saved regular equity curve to {EQUITY_CURVE_FILE}")
-    print(f"Saved ${CHEAP_MAX_PREMIUM:g}-max trades to {CHEAP_RESULTS_FILE}")
-    print(f"Saved ${CHEAP_MAX_PREMIUM:g}-max equity curve to {CHEAP_EQUITY_CURVE_FILE}")
+    print(f"Saved ${max_option_premium:g}-max trades to {CHEAP_RESULTS_FILE}")
+    print(f"Saved ${max_option_premium:g}-max equity curve to {CHEAP_EQUITY_CURVE_FILE}")
 
 
 def print_paper_results():
-    from analytics import build_strategy_report
+    from analytics import build_strategy_report, summarize_performance_since
 
     strategy_names = [strategy["name"] for strategy in PAPER_STRATEGIES]
     report = build_strategy_report(strategy_names)
@@ -711,6 +813,16 @@ def print_paper_results():
 
     for strategy in strategy_names:
         stats = report[strategy]
+        current_prices = {
+            item["option_symbol"]: item["current_price"]
+            for item in stats["open_positions"]
+            if item["current_price"] is not None
+        }
+        performance = summarize_performance_since(
+            BOT_PERFORMANCE_START_DATE,
+            current_prices=current_prices,
+            strategy=strategy,
+        )
         completed = stats["completed_trades"]
         win_rate = stats["wins"] / completed if completed else 0
         print(f"\n{strategy}")
@@ -723,6 +835,25 @@ def print_paper_results():
         print(f"Total P/L: ${stats['realized_pnl'] + stats['unrealized_pnl']:.2f}")
         print(f"Open positions: {len(stats['open_positions'])}")
         print(f"Pending orders: {stats['pending_orders']}")
+        print(f"Starting virtual capital: ${performance['starting_virtual_capital']:.2f}")
+        print(f"Ending virtual capital: ${performance['ending_virtual_capital']:.2f}")
+        print(f"Total return: {performance['return_pct']:.2f}%")
+        print(f"Return on capital employed: {performance['return_on_capital_employed']:.2f}%")
+        print(f"Premium paid: ${performance['premium_paid']:.2f}")
+        print(f"Premium lost: ${performance['premium_lost']:.2f}")
+        print(f"Average option premium: ${performance['average_option_premium']:.2f}")
+        print(f"Maximum capital employed: ${performance['maximum_capital_employed']:.2f}")
+        print(f"Average hold time: {performance['average_hold_days']:.1f} days")
+        print(f"Expectancy: ${performance['expectancy']:.2f}/trade")
+        print(f"Average winner: ${performance['average_winner']:.2f}")
+        print(f"Average loser: ${performance['average_loser']:.2f}")
+        print(f"Largest winner: ${performance['largest_winner']:.2f}")
+        print(f"Largest loser: ${performance['largest_loser']:.2f}")
+        print(f"Profit factor: {performance['profit_factor']:.2f}")
+        print(f"Maximum drawdown: ${performance['max_drawdown']:.2f}")
+        print(f"Average DTE: {performance['average_dte']:.1f}")
+        print(f"Average spread: {performance['average_spread_pct']:.2f}%")
+        print(f"Expired worthless: {performance['expired_worthless']}")
         for position in sorted(
             stats["open_positions"], key=lambda item: item["option_symbol"]
         ):
@@ -748,6 +879,13 @@ def parse_args():
     )
     parser.add_argument("--period", help="Optional yfinance period override, for example 3y")
     parser.add_argument("--interval", default="1d", help="yfinance interval to backtest. Default: 1d")
+    parser.add_argument(
+        "--max-option-premium",
+        type=int,
+        choices=(250, 500, 750, 1000),
+        default=int(MAX_OPTION_PREMIUM_PER_TRADE),
+        help="Maximum premium per long-call trade. Choices: 250, 500, 750, 1000.",
+    )
     parser.add_argument(
         "--paper-results",
         action="store_true",
@@ -779,11 +917,12 @@ if __name__ == "__main__":
     elif args.alpaca_options:
         period = args.period or YEARS_TO_PERIOD[args.years]
         run_alpaca_option_backtest(
-            period, args.interval, args.alpaca_options, args.max_candidates
+            period, args.interval, args.alpaca_options, args.max_candidates,
+            args.max_option_premium,
         )
     elif args.compare_signals:
         period = args.period or YEARS_TO_PERIOD[args.years]
         run_signal_comparison(period, args.interval)
     else:
         period = args.period or YEARS_TO_PERIOD[args.years]
-        run_backtest(period, args.interval)
+        run_backtest(period, args.interval, args.max_option_premium)

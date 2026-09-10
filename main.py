@@ -31,6 +31,7 @@ from analytics import (
     get_strategy_open_lots,
     get_submitted_orders,
     record_event,
+    record_rejected_trade,
     signal_bar_already_submitted,
 )
 from bot_logger import bot_log, setup_logging
@@ -201,7 +202,9 @@ def run_bot():
                 underlying,
                 option_type=OPTION_TYPE,
                 min_dte=MIN_DTE,
-                max_dte=MAX_DTE
+                max_dte=MAX_DTE,
+                strategies=[item[0]["name"] for item in eligible_variants],
+                market_regime="bullish" if market_regime_ok else "not_bullish",
             )
 
             if option_symbol:
@@ -229,6 +232,11 @@ def run_bot():
                             "SKIP", strategy=strategy_name, underlying=underlying,
                             reason="max_positions"
                         )
+                        record_rejected_trade(
+                            "MAX_STRATEGY_EXPOSURE_REACHED",
+                            strategy=strategy_name, underlying=underlying,
+                            contract_symbol=option_symbol, market_regime="bullish",
+                        )
                         blocked += 1
                         continue
                     target_group = correlation_group(underlying)
@@ -241,6 +249,11 @@ def run_bot():
                             "SKIP", strategy=strategy_name, underlying=underlying,
                             reason=f"correlation_group_{target_group}"
                         )
+                        record_rejected_trade(
+                            "OTHER", strategy=strategy_name,
+                            underlying=underlying, contract_symbol=option_symbol,
+                            market_regime="bullish",
+                        )
                         blocked += 1
                         continue
                     already_holds = any(
@@ -251,6 +264,11 @@ def run_bot():
                         record_event(
                             "SKIP", strategy=strategy_name, underlying=underlying,
                             reason="already_holding"
+                        )
+                        record_rejected_trade(
+                            "DUPLICATE_POSITION", strategy=strategy_name,
+                            underlying=underlying, contract_symbol=option_symbol,
+                            market_regime="bullish",
                         )
                         blocked += 1
                         continue

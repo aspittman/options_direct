@@ -3,6 +3,7 @@ from datetime import date
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
+import config
 import options_trader
 import strategy
 
@@ -13,6 +14,7 @@ from analytics import (
     get_underlying_high_water_marks,
     signal_bar_already_submitted,
     summarize_performance_since,
+    get_virtual_cash_available,
 )
 from options_trader import (
     calculate_underlying_trailing_stop,
@@ -47,6 +49,84 @@ class TerminalSummaryTests(unittest.TestCase):
         self.assertIn("$500", row)
         self.assertIn("$     50.00", row)
         self.assertIn("+10.00%", row)
+
+
+class LongCallCapitalRuleTests(unittest.TestCase):
+    def test_standardized_long_call_capital_constants(self):
+        self.assertEqual(config.VIRTUAL_STARTING_CAPITAL, 25000)
+        self.assertEqual(config.MAX_OPTION_PREMIUM_PER_TRADE, 500)
+        self.assertEqual(config.MAX_CONTRACTS_PER_TRADE, 1)
+        self.assertEqual(config.CONTRACT_QTY, 1)
+
+    @patch("options_trader.record_rejected_trade")
+    @patch("options_trader.get_virtual_cash_available", return_value=25000)
+    @patch("options_trader.get_strategy_open_lots", return_value={})
+    @patch("options_trader.get_options_direct_positions", return_value=[])
+    def test_rejects_more_than_one_contract(
+        self, _positions, _lots, _cash, rejected
+    ):
+        submitted = options_trader.buy_option_contract(
+            "SPY261218C00700000", qty=2, underlying="SPY"
+        )
+
+        self.assertFalse(submitted)
+        self.assertEqual(
+            rejected.call_args.args[0], "MAX_CONTRACTS_REACHED"
+        )
+
+    @patch("options_trader.trading_client.submit_order")
+    @patch("options_trader.record_rejected_trade")
+    @patch("options_trader.get_underlying_price", return_value=700)
+    @patch("options_trader.get_virtual_cash_available", return_value=25000)
+    @patch("options_trader.get_option_snapshots")
+    @patch("options_trader._strategy_has_pending_order", return_value=False)
+    @patch("options_trader.get_strategy_open_lots", return_value={})
+    @patch("options_trader.get_options_direct_positions", return_value=[])
+    def test_rejects_preferred_contract_over_500_premium(
+        self, _positions, _lots, _pending, snapshots, _cash, _price,
+        rejected, submit
+    ):
+        snapshots.return_value = {
+            "SPY261218C00700000": MagicMock(
+                latest_quote=MagicMock(bid_price=6.00, ask_price=6.50)
+            )
+        }
+
+        submitted = options_trader.buy_option_contract(
+            "SPY261218C00700000", qty=1, underlying="SPY"
+        )
+
+        self.assertFalse(submitted)
+        self.assertEqual(rejected.call_args.args[0], "PREMIUM_OVER_LIMIT")
+        submit.assert_not_called()
+
+    @patch("analytics.get_submitted_orders", return_value={})
+    @patch("analytics.read_events")
+    def test_virtual_cash_uses_only_long_call_ledger(self, events, _pending):
+        events.return_value = [
+            {"event": "ORDER_FILL", "order_side": "buy", "qty": "1", "price": "4"},
+            {"event": "ORDER_FILL", "order_side": "sell", "qty": "1", "price": "5"},
+        ]
+
+        self.assertEqual(get_virtual_cash_available(), 25100)
+
+    @patch("options_trader.get_owned_option_symbols")
+    @patch("options_trader.trading_client.get_all_positions")
+    def test_position_management_is_limited_to_owned_long_calls(
+        self, positions, owned
+    ):
+        long_call = MagicMock(symbol="SPY261218C00700000", qty="1")
+        long_put = MagicMock(symbol="SPY261218P00700000", qty="1")
+        short_call = MagicMock(symbol="QQQ261218C00600000", qty="-1")
+        unowned_call = MagicMock(symbol="AAPL261218C00250000", qty="1")
+        positions.return_value = [long_call, long_put, short_call, unowned_call]
+        owned.return_value = {
+            long_call.symbol, long_put.symbol, short_call.symbol,
+        }
+
+        result = options_trader.get_options_direct_positions()
+
+        self.assertEqual(result, [long_call])
 
 
 class PortfolioConstraintTests(unittest.TestCase):
@@ -99,6 +179,26 @@ class PortfolioConstraintTests(unittest.TestCase):
         )
 
         self.assertEqual([item["symbol"] for item in selected], ["B"])
+
+    def test_reports_capital_only_rejections(self):
+        counts = {
+            "premium_over_limit": 0,
+            "capital_or_exposure": 0,
+            "portfolio_constraints": 0,
+        }
+        candidates = [
+            trade("A", "2026-01-01", "2026-01-03", 6.00, 7.00),
+            trade("B", "2026-01-01", "2026-01-03", 4.00, 5.00),
+        ]
+
+        selected = apply_portfolio_constraints(
+            candidates, starting_cash=25000, max_positions=2,
+            max_total_premium=1000, max_entry_premium=500,
+            rejection_counts=counts,
+        )
+
+        self.assertEqual([item["symbol"] for item in selected], ["B"])
+        self.assertEqual(counts["premium_over_limit"], 1)
 
     def test_rejects_a_second_correlated_position(self):
         candidates = [
@@ -252,7 +352,10 @@ class AnalyticsGuardTests(unittest.TestCase):
         self.assertEqual(result["realized_pnl"], 100)
         self.assertEqual(result["unrealized_pnl"], 50)
         self.assertEqual(result["total_pnl"], 150)
-        self.assertEqual(result["return_pct"], 30)
+        self.assertEqual(result["return_pct"], 0.6)
+        self.assertEqual(result["starting_virtual_capital"], 25000)
+        self.assertEqual(result["ending_virtual_capital"], 25150)
+        self.assertEqual(result["return_on_capital_employed"], 30)
         self.assertEqual(result["open_positions"], 1)
         self.assertEqual(result["positions_value"], 250)
 
@@ -260,7 +363,7 @@ class AnalyticsGuardTests(unittest.TestCase):
             "2026-08-21", current_prices={"AAPL1": 2.5}, strategy="regular"
         )
         self.assertEqual(regular["deployed_premium"], 500)
-        self.assertEqual(regular["return_pct"], 30)
+        self.assertEqual(regular["return_pct"], 0.6)
 
     @patch("analytics.read_events")
     def test_cooldown_counts_trading_days(self, read_events):
@@ -361,6 +464,7 @@ class TrailingStopTests(unittest.TestCase):
 
         order = submit_order.call_args.args[0]
         self.assertEqual(float(order.limit_price), 3.10)
+        self.assertTrue(order.client_order_id.startswith("long_call_BAC_x_"))
 
 
 if __name__ == "__main__":
