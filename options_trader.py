@@ -460,10 +460,12 @@ def contract_score(contract, snapshot, volume, underlying_price):
 
 
 def _record_contract_rejections(strategies, reason, underlying, **fields):
+    call_or_put = fields.pop("call_or_put", "call")
+    long_or_short = fields.pop("long_or_short", "long")
     for strategy in strategies or ("",):
         record_rejected_trade(
             reason, strategy=strategy, underlying=underlying,
-            call_or_put="call", long_or_short="long", **fields
+            call_or_put=call_or_put, long_or_short=long_or_short, **fields
         )
 
 
@@ -471,6 +473,15 @@ def get_option_contract(
     underlying, option_type="call", min_dte=30, max_dte=60,
     strategies=(), market_regime="bullish",
 ):
+    if option_type != "call":
+        bot_log(
+            f"Rejected contract lookup for {underlying}: LongCallBot only trades calls"
+        )
+        _record_contract_rejections(
+            strategies, "OTHER", underlying, call_or_put=option_type,
+            long_or_short="long", market_regime=market_regime,
+        )
+        return None
     today = date.today()
     min_exp = today + timedelta(days=min_dte)
     max_exp = today + timedelta(days=max_dte)
@@ -485,14 +496,12 @@ def get_option_contract(
         )
         return None
 
-    contract_type = ContractType.CALL if option_type == "call" else ContractType.PUT
-
     request = GetOptionContractsRequest(
         underlying_symbols=[underlying],
         status=AssetStatus.ACTIVE,
         expiration_date_gte=min_exp,
         expiration_date_lte=max_exp,
-        type=contract_type,
+        type=ContractType.CALL,
         # alpaca-py models strike filters as strings (even though they contain
         # numeric values). Passing floats fails Pydantic validation before the
         # API request is made.
@@ -856,6 +865,22 @@ def buy_option_contract(
         lot_strategy == strategy and symbol == option_symbol
         for lot_strategy, _, symbol in strategy_lots
     )
+    if not parsed or parsed["option_type"] != "call":
+        bot_log(
+            f"Rejected order for {option_symbol}: LongCallBot only buys call contracts"
+        )
+        record_event(
+            "SKIP", strategy=strategy, underlying=underlying,
+            option_symbol=option_symbol, reason="non_call_contract",
+        )
+        record_rejected_trade(
+            "OTHER", strategy=strategy, underlying=underlying,
+            contract_symbol=option_symbol,
+            call_or_put=parsed["option_type"] if parsed else "unknown",
+            long_or_short="long",
+            virtual_capital_available=get_virtual_cash_available(),
+        )
+        return False
     if qty > MAX_CONTRACTS_PER_TRADE:
         bot_log(
             f"Contract limit blocked strategy={strategy} {option_symbol}: "

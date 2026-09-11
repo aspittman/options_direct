@@ -67,6 +67,10 @@ own ledger. Account equity and buying power never increase its limits: research
 returns use an independent $25,000 virtual allocation, and long-call capital
 employed is the premium paid.
 
+Long-call-only behavior is enforced twice: contract discovery refuses any
+non-call request, and the final order gate parses the OCC option symbol and
+rejects anything that is not a call before submitting it to Alpaca.
+
 Every new entry and exit order uses a `long_call_<underlying>_<timestamp>` client
 order ID (exit IDs also contain `_x_`). Before canceling a stale order, the bot
 retrieves it from Alpaca and verifies that its client order ID starts with

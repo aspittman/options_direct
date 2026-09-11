@@ -128,6 +128,30 @@ class LongCallCapitalRuleTests(unittest.TestCase):
 
         self.assertEqual(result, [long_call])
 
+    @patch("options_trader.trading_client.get_option_contracts")
+    @patch("options_trader.record_rejected_trade")
+    def test_contract_lookup_refuses_put_requests(self, _rejected, lookup):
+        result = options_trader.get_option_contract("SPY", option_type="put")
+
+        self.assertIsNone(result)
+        lookup.assert_not_called()
+
+    @patch("options_trader.get_virtual_cash_available", return_value=25000)
+    @patch("options_trader.record_rejected_trade")
+    @patch("options_trader.trading_client.submit_order")
+    @patch("options_trader.get_strategy_open_lots", return_value={})
+    @patch("options_trader.get_options_direct_positions", return_value=[])
+    def test_final_order_gate_refuses_put_contract(
+        self, _positions, _lots, submit, rejected, _cash
+    ):
+        result = options_trader.buy_option_contract(
+            "SPY261218P00700000", underlying="SPY"
+        )
+
+        self.assertFalse(result)
+        submit.assert_not_called()
+        self.assertEqual(rejected.call_args.kwargs["call_or_put"], "put")
+
 
 class OrderOwnershipTests(unittest.TestCase):
     def test_order_ownership_requires_long_call_prefix(self):
