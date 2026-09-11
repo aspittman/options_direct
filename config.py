@@ -43,7 +43,7 @@ def require_alpaca_credentials():
 
     return API_KEY, SECRET_KEY
 
-UNDERLYINGS = [
+ORIGINAL_UNDERLYINGS = [
     "SPY",
     "QQQ",
     "IWM",
@@ -85,6 +85,32 @@ UNDERLYINGS = [
     "DIS",
     "BA",
 ]
+
+# Research universe biased toward actively traded, lower-notional option chains.
+# These names are candidates only: the normal signal, DTE, delta, liquidity,
+# spread, and actual $500 premium checks still decide whether a trade is valid.
+AFFORDABLE_UNIVERSE_ADDITIONS = [
+    "XLF", "XLE", "XLV", "XLK", "XLI", "XLP", "XLU", "XLY", "SMH",
+    "EEM", "FXI", "EWZ", "GDX", "GDXJ", "SLV", "TLT", "HYG", "ARKK",
+    "USO", "F", "T", "VZ", "KMI", "SOFI", "HOOD", "SNAP", "UBER",
+    "RIVN", "PLTR", "PARA",
+]
+NON_CORPORATE_UNDERLYINGS = {
+    "SPY", "QQQ", "IWM", "DIA", "XLF", "XLE", "XLV", "XLK", "XLI",
+    "XLP", "XLU", "XLY", "SMH", "EEM", "FXI", "EWZ", "GDX", "GDXJ",
+    "SLV", "TLT", "HYG", "ARKK", "USO",
+}
+EXPANDED_UNDERLYINGS = list(dict.fromkeys(
+    ORIGINAL_UNDERLYINGS + AFFORDABLE_UNIVERSE_ADDITIONS
+))
+UNIVERSE_PROFILE = os.getenv("UNIVERSE_PROFILE", "expanded").strip().lower()
+if UNIVERSE_PROFILE not in {"original", "expanded"}:
+    raise ValueError("UNIVERSE_PROFILE must be 'original' or 'expanded'")
+UNDERLYINGS = (
+    ORIGINAL_UNDERLYINGS
+    if UNIVERSE_PROFILE == "original"
+    else EXPANDED_UNDERLYINGS
+)
 
 def _env_bool(name, default=False):
     return os.getenv(name, str(default)).strip().lower() in {"1", "true", "yes", "on"}
@@ -144,11 +170,21 @@ CORRELATION_GROUPS = {
     "technology": {
         "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "GOOG", "TSLA",
         "AMD", "NFLX", "AVGO", "CRM", "ORCL", "ADBE", "INTC", "QCOM", "MU",
+        "XLK", "SMH", "PLTR",
     },
-    "financials": {"JPM", "BAC", "GS", "MS", "C"},
-    "energy": {"XOM", "CVX", "COP", "SLB"},
-    "healthcare": {"UNH", "LLY", "JNJ", "PFE", "MRK"},
-    "consumer_industrial": {"COST", "WMT", "HD", "DIS", "BA"},
+    "financials": {"JPM", "BAC", "GS", "MS", "C", "XLF", "SOFI", "HOOD"},
+    "energy": {"XOM", "CVX", "COP", "SLB", "XLE", "USO", "KMI"},
+    "healthcare": {"UNH", "LLY", "JNJ", "PFE", "MRK", "XLV"},
+    "consumer_industrial": {
+        "COST", "WMT", "HD", "DIS", "BA", "XLI", "XLP", "XLY", "F",
+        "UBER", "RIVN", "PARA",
+    },
+    "international": {"EEM", "FXI", "EWZ"},
+    "precious_metals": {"GDX", "GDXJ", "SLV"},
+    "rates_credit": {"TLT", "HYG"},
+    "communications": {"T", "VZ"},
+    "speculative_growth": {"ARKK", "SNAP"},
+    "utilities": {"XLU"},
 }
 
 

@@ -115,6 +115,12 @@ is rejected; the bot does not substitute a cheaper far-OTM contract. Signal-qual
 rejections are written to `logs/rejected_trades.csv` with standardized reasons and
 available quote, contract, capital, and regime context.
 
+The default `expanded` universe contains the original 40 symbols plus 30 actively
+traded, generally lower-notional stocks and ETFs. Set `UNIVERSE_PROFILE=original`
+to restore the original list. Membership is only an affordability-oriented first
+pass: every candidate still has to pass the unchanged bullish signal, 60–90 DTE,
+delta, liquidity, spread, and actual quoted-premium checks.
+
 Both variants submit separately tagged paper orders. Alpaca combines quantities
 when both variants own the same contract, while `logs/trade_analytics.csv` keeps
 the confirmed fill price and virtual quantity for each variant. Runtime summaries
@@ -132,6 +138,7 @@ python backtester.py --years 5 --max-option-premium 250
 python backtester.py --years 5 --max-option-premium 500
 python backtester.py --years 5 --max-option-premium 750
 python backtester.py --years 5 --max-option-premium 1000
+python backtester.py --years 5 --max-option-premium 500 --compare-universes
 python backtester.py --years 5 --compare-signals
 python backtester.py --years 2 --alpaca-options swing --max-candidates 100
 ```

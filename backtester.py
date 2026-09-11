@@ -23,6 +23,8 @@ from config import (
     TARGET_DELTA,
     UNDERLYING_TRAILING_STOP_PERCENT,
     UNDERLYINGS,
+    ORIGINAL_UNDERLYINGS,
+    EXPANDED_UNDERLYINGS,
     PAPER_STRATEGIES,
     MAX_POSITIONS,
     MAX_TOTAL_OPTION_PREMIUM,
@@ -751,13 +753,19 @@ def _research_counts():
     }
 
 
-def run_backtest(period, interval, max_option_premium=MAX_OPTION_PREMIUM_PER_TRADE):
+def run_backtest(
+    period, interval, max_option_premium=MAX_OPTION_PREMIUM_PER_TRADE,
+    underlyings=None, universe_name=None, save_results=True,
+):
+    underlyings = list(underlyings or UNDERLYINGS)
+    universe_name = universe_name or "configured"
     regular_trades = []
     cheap_trades = []
     regular_counts = _research_counts()
     swing_counts = _research_counts()
 
-    for symbol in UNDERLYINGS:
+    print(f"\nUniverse: {universe_name} ({len(underlyings)} symbols)")
+    for symbol in underlyings:
         print(f"Backtesting {symbol}...")
         close = get_close_series(symbol, period, interval)
         if close is None:
@@ -783,10 +791,11 @@ def run_backtest(period, interval, max_option_premium=MAX_OPTION_PREMIUM_PER_TRA
     )
     regular_equity_curve = build_equity_curve(regular_trades)
     cheap_equity_curve = build_equity_curve(cheap_trades)
-    save_trades(regular_trades, RESULTS_FILE)
-    save_equity_curve(regular_equity_curve, EQUITY_CURVE_FILE)
-    save_trades(cheap_trades, CHEAP_RESULTS_FILE)
-    save_equity_curve(cheap_equity_curve, CHEAP_EQUITY_CURVE_FILE)
+    if save_results:
+        save_trades(regular_trades, RESULTS_FILE)
+        save_equity_curve(regular_equity_curve, EQUITY_CURVE_FILE)
+        save_trades(cheap_trades, CHEAP_RESULTS_FILE)
+        save_equity_curve(cheap_equity_curve, CHEAP_EQUITY_CURVE_FILE)
 
     print_summary(
         regular_trades, "Regular Options Backtest Summary",
@@ -796,10 +805,20 @@ def run_backtest(period, interval, max_option_premium=MAX_OPTION_PREMIUM_PER_TRA
         cheap_trades, f"${max_option_premium:g} Daily Swing Backtest Summary",
         research_counts=swing_counts,
     )
-    print(f"\nSaved regular trades to {RESULTS_FILE}")
-    print(f"Saved regular equity curve to {EQUITY_CURVE_FILE}")
-    print(f"Saved ${max_option_premium:g}-max trades to {CHEAP_RESULTS_FILE}")
-    print(f"Saved ${max_option_premium:g}-max equity curve to {CHEAP_EQUITY_CURVE_FILE}")
+    if save_results:
+        print(f"\nSaved regular trades to {RESULTS_FILE}")
+        print(f"Saved regular equity curve to {EQUITY_CURVE_FILE}")
+        print(f"Saved ${max_option_premium:g}-max trades to {CHEAP_RESULTS_FILE}")
+        print(f"Saved ${max_option_premium:g}-max equity curve to {CHEAP_EQUITY_CURVE_FILE}")
+
+    return {
+        "universe": universe_name,
+        "symbol_count": len(underlyings),
+        "regular_trades": regular_trades,
+        "swing_trades": cheap_trades,
+        "regular_counts": regular_counts,
+        "swing_counts": swing_counts,
+    }
 
 
 def print_paper_results():
@@ -887,6 +906,17 @@ def parse_args():
         help="Maximum premium per long-call trade. Choices: 250, 500, 750, 1000.",
     )
     parser.add_argument(
+        "--universe",
+        choices=("original", "expanded"),
+        default=None,
+        help="Universe to test. Defaults to UNIVERSE_PROFILE from configuration.",
+    )
+    parser.add_argument(
+        "--compare-universes",
+        action="store_true",
+        help="Run the original 40-symbol and expanded universes side by side.",
+    )
+    parser.add_argument(
         "--paper-results",
         action="store_true",
         help="Show live Alpaca paper-fill performance without running a historical backtest.",
@@ -925,4 +955,22 @@ if __name__ == "__main__":
         run_signal_comparison(period, args.interval)
     else:
         period = args.period or YEARS_TO_PERIOD[args.years]
-        run_backtest(period, args.interval, args.max_option_premium)
+        if args.compare_universes:
+            run_backtest(
+                period, args.interval, args.max_option_premium,
+                ORIGINAL_UNDERLYINGS, "original", save_results=False,
+            )
+            run_backtest(
+                period, args.interval, args.max_option_premium,
+                EXPANDED_UNDERLYINGS, "expanded", save_results=True,
+            )
+        else:
+            selected = (
+                ORIGINAL_UNDERLYINGS if args.universe == "original"
+                else EXPANDED_UNDERLYINGS if args.universe == "expanded"
+                else UNDERLYINGS
+            )
+            run_backtest(
+                period, args.interval, args.max_option_premium,
+                selected, args.universe or "configured",
+            )

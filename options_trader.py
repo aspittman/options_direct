@@ -34,6 +34,7 @@ from config import (
     MIN_OPEN_INTEREST,
     MIN_OPTION_VOLUME,
     OPTION_DATA_FEED,
+    NON_CORPORATE_UNDERLYINGS,
     TARGET_DELTA,
     ALLOW_MULTIPLE_CONTRACTS_PER_UNDERLYING,
     EXIT_DTE,
@@ -68,7 +69,7 @@ trading_client = TradingClient(API_KEY, SECRET_KEY, paper=ALPACA_PAPER)
 option_data_client = OptionHistoricalDataClient(API_KEY, SECRET_KEY)
 stock_data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 
-_NON_CORPORATE_UNDERLYINGS = {"SPY", "QQQ", "IWM", "DIA"}
+_NON_CORPORATE_UNDERLYINGS = NON_CORPORATE_UNDERLYINGS
 _earnings_cache = {}
 _CLIENT_ORDER_ID_PREFIX = f"{BOT_STRATEGY_ID}_"
 

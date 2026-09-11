@@ -52,6 +52,19 @@ class TerminalSummaryTests(unittest.TestCase):
 
 
 class LongCallCapitalRuleTests(unittest.TestCase):
+    def test_expanded_universe_preserves_original_and_adds_candidates(self):
+        self.assertEqual(len(config.ORIGINAL_UNDERLYINGS), 40)
+        self.assertGreater(len(config.EXPANDED_UNDERLYINGS), 40)
+        self.assertTrue(set(config.ORIGINAL_UNDERLYINGS).issubset(
+            config.EXPANDED_UNDERLYINGS
+        ))
+        self.assertEqual(len(config.EXPANDED_UNDERLYINGS), len(set(
+            config.EXPANDED_UNDERLYINGS
+        )))
+        self.assertTrue({"XLF", "GDX", "TLT"}.issubset(
+            config.NON_CORPORATE_UNDERLYINGS
+        ))
+
     def test_standardized_long_call_capital_constants(self):
         self.assertEqual(config.VIRTUAL_STARTING_CAPITAL, 25000)
         self.assertEqual(config.MAX_OPTION_PREMIUM_PER_TRADE, 500)
