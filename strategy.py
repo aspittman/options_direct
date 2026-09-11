@@ -3,6 +3,7 @@ import pandas as pd
 from datetime import date, datetime, timedelta
 from time import monotonic, sleep
 from requests.exceptions import RequestException
+from alpaca.common.exceptions import APIError
 from alpaca.data.enums import DataFeed
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
@@ -55,14 +56,26 @@ def _download_daily_history(symbol):
 
 
 def wait_for_market_open(trading_client):
-    import time
-
     while True:
         try:
             clock = trading_client.get_clock()
-        except RequestException as e:
+        except (APIError, RequestException) as e:
+            # Alpaca occasionally returns a transient 5xx response. alpaca-py
+            # raises APIError for that response rather than RequestException.
+            # Authentication and other definite client errors should still stop
+            # the bot instead of being hidden in an endless retry loop.
+            http_error = getattr(e, "http_error", None)
+            response = getattr(http_error, "response", None)
+            status_code = getattr(response, "status_code", None)
+            if (
+                isinstance(e, APIError)
+                and status_code is not None
+                and 400 <= status_code < 500
+                and status_code != 429
+            ):
+                raise
             bot_log(f"Could not get market clock from Alpaca: {e}. Retrying in 60 seconds.")
-            time.sleep(60)
+            sleep(60)
             continue
 
         if clock.is_open:
@@ -70,7 +83,7 @@ def wait_for_market_open(trading_client):
             break
 
         bot_log("Market closed. Waiting...")
-        time.sleep(60)
+        sleep(60)
 
 
 def _completed_daily_close(symbol):

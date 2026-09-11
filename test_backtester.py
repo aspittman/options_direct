@@ -6,6 +6,7 @@ import pandas as pd
 import config
 import options_trader
 import strategy
+from alpaca.common.exceptions import APIError
 
 from backtester import apply_portfolio_constraints, build_swing_signals, is_swing_entry_at
 from config import correlation_group
@@ -64,7 +65,6 @@ class LongCallCapitalRuleTests(unittest.TestCase):
         self.assertTrue({"XLF", "GDX", "TLT"}.issubset(
             config.NON_CORPORATE_UNDERLYINGS
         ))
-
     def test_standardized_long_call_capital_constants(self):
         self.assertEqual(config.VIRTUAL_STARTING_CAPITAL, 25000)
         self.assertEqual(config.MAX_OPTION_PREMIUM_PER_TRADE, 500)
@@ -473,6 +473,21 @@ class AnalyticsGuardTests(unittest.TestCase):
         }]
         self.assertTrue(signal_bar_already_submitted("regular", "SPY", "2026-08-11"))
         self.assertFalse(signal_bar_already_submitted("regular", "SPY", "2026-08-12"))
+
+
+class MarketClockRetryTests(unittest.TestCase):
+    @patch("strategy.sleep")
+    def test_transient_alpaca_api_error_retries_without_crashing(self, retry_sleep):
+        client = MagicMock()
+        client.get_clock.side_effect = [
+            APIError({"message": "Internal Server Error"}),
+            MagicMock(is_open=True),
+        ]
+
+        strategy.wait_for_market_open(client)
+
+        self.assertEqual(client.get_clock.call_count, 2)
+        retry_sleep.assert_called_once_with(60)
 
 
 class TrailingStopTests(unittest.TestCase):
