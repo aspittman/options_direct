@@ -129,6 +129,55 @@ class LongCallCapitalRuleTests(unittest.TestCase):
         self.assertEqual(result, [long_call])
 
 
+class OrderOwnershipTests(unittest.TestCase):
+    def test_order_ownership_requires_long_call_prefix(self):
+        self.assertTrue(options_trader.is_own_order(
+            MagicMock(client_order_id="long_call_SPY_123")
+        ))
+        self.assertFalse(options_trader.is_own_order(
+            MagicMock(client_order_id="long_put_SPY_123")
+        ))
+        self.assertFalse(options_trader.is_own_order(
+            MagicMock(client_order_id="od-regular-legacy")
+        ))
+
+    @patch("options_trader.trading_client.get_orders")
+    def test_open_order_check_ignores_other_bots(self, get_orders):
+        get_orders.return_value = [
+            MagicMock(symbol="SPY261218C00700000", client_order_id="long_put_SPY_1"),
+            MagicMock(symbol="QQQ261218C00600000", client_order_id="long_call_QQQ_1"),
+        ]
+
+        self.assertFalse(options_trader.has_open_order("SPY261218C00700000"))
+        self.assertTrue(options_trader.has_open_order("QQQ261218C00600000"))
+
+    @patch("options_trader.record_event")
+    @patch("options_trader.trading_client.cancel_order_by_id")
+    @patch("options_trader.trading_client.get_order_by_id")
+    @patch("options_trader.get_submitted_orders")
+    def test_timeout_never_cancels_foreign_client_order_id(
+        self, submitted, get_order, cancel, record
+    ):
+        submitted.return_value = {
+            "order-1": {
+                "timestamp": "2020-01-01T00:00:00",
+                "strategy": "regular",
+                "underlying": "SPY",
+                "option_symbol": "SPY261218C00700000",
+                "order_side": "buy",
+            }
+        }
+        get_order.return_value = MagicMock(
+            status="pending_new", filled_qty="0", filled_avg_price=None,
+            client_order_id="long_put_SPY_123",
+        )
+
+        options_trader.reconcile_order_fills()
+
+        cancel.assert_not_called()
+        self.assertEqual(record.call_args.args[0], "ORDER_OWNERSHIP_MISMATCH")
+
+
 class PortfolioConstraintTests(unittest.TestCase):
     def test_allows_two_concurrent_positions_and_rejects_third(self):
         candidates = [

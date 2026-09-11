@@ -12,7 +12,6 @@ from alpaca.data.requests import (
 from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
-    ClosePositionRequest,
     LimitOrderRequest,
     GetOptionContractsRequest
 )
@@ -71,6 +70,7 @@ stock_data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 
 _NON_CORPORATE_UNDERLYINGS = {"SPY", "QQQ", "IWM", "DIA"}
 _earnings_cache = {}
+_CLIENT_ORDER_ID_PREFIX = f"{BOT_STRATEGY_ID}_"
 
 
 def _option_feed():
@@ -136,10 +136,18 @@ def get_open_positions_count():
     return len(get_options_direct_positions())
 
 
+def is_own_order(order):
+    """Return true only for broker orders explicitly tagged for this bot."""
+    client_order_id = str(getattr(order, "client_order_id", "") or "")
+    return client_order_id.startswith(_CLIENT_ORDER_ID_PREFIX)
+
+
 def has_open_order(symbol):
     try:
         orders = trading_client.get_orders()
-        return any(order.symbol == symbol for order in orders)
+        return any(
+            order.symbol == symbol and is_own_order(order) for order in orders
+        )
     except Exception:
         return False
 
@@ -746,6 +754,23 @@ def reconcile_order_fills():
                 now = datetime.now(submitted_at.tzinfo) if submitted_at.tzinfo else datetime.now()
                 age = now - submitted_at
                 if age >= timedelta(minutes=timeout_minutes):
+                    if not is_own_order(order):
+                        bot_log(
+                            f"Refusing to cancel order {order_id}: Alpaca client_order_id "
+                            f"does not start with {_CLIENT_ORDER_ID_PREFIX}"
+                        )
+                        record_event(
+                            "ORDER_OWNERSHIP_MISMATCH",
+                            strategy=submitted.get("strategy", ""),
+                            underlying=submitted.get("underlying", ""),
+                            option_symbol=submitted.get("option_symbol", ""),
+                            order_id=order_id,
+                            order_side=submitted.get("order_side", ""),
+                            order_status=status,
+                            reason="foreign_client_order_id",
+                            details=f"client_order_id={getattr(order, 'client_order_id', '')}",
+                        )
+                        continue
                     trading_client.cancel_order_by_id(order_id)
                     record_event(
                         "ORDER_TERMINAL", strategy=submitted.get("strategy", ""),
@@ -1001,42 +1026,24 @@ def get_option_positions_for_underlying(underlying):
 
 
 def close_option_position(position, underlying, reason):
-    if has_open_order(position.symbol):
-        bot_log(f"Open order exists for {position.symbol}. Exit skipped.")
-        return
-
-    qty = getattr(position, "qty_available", None) or getattr(position, "qty", None)
-    qty_float = _to_float(qty)
-
-    if qty_float is not None and qty_float <= 0:
-        bot_log(f"No available quantity to exit for {position.symbol}.")
-        return
-
-    try:
-        close_request = ClosePositionRequest(qty=qty) if qty else None
-        submitted_order = trading_client.close_position(position.symbol, close_request)
-        bot_log(f"Submitted exit for {position.symbol}: {reason}")
-        record_event(
-            "EXIT_SUBMITTED",
-            underlying=underlying,
-            option_symbol=position.symbol,
-            qty=qty,
-            price=get_underlying_price(underlying) or "",
-            unrealized_pnl=_to_float(getattr(position, "unrealized_pl", None)) or 0,
-            reason=reason,
-            details=f"order_id={getattr(submitted_order, 'id', '')}"
+    """Close only virtual lots owned by this bot, using tagged limit orders."""
+    matching_lots = [
+        (strategy, lot) for (strategy, lot_underlying, symbol), lot
+        in get_strategy_open_lots().items()
+        if lot_underlying == underlying and symbol == position.symbol
+    ]
+    if not matching_lots:
+        bot_log(
+            f"Refusing generic exit for unowned position {position.symbol}"
         )
-
-    except (APIError, RequestException) as e:
-        bot_log(f"Exit failed for {position.symbol}: {e}")
-        record_event(
-            "ORDER_FAILED",
-            underlying=underlying,
-            option_symbol=position.symbol,
-            qty=qty,
-            reason="exit_failed",
-            details=str(e)
+        return False
+    submitted = False
+    for strategy, lot in matching_lots:
+        result = close_strategy_lot(
+            strategy, underlying, position.symbol, lot["qty"], reason
         )
+        submitted = bool(result) or submitted
+    return submitted
 
 
 def close_strategy_lot(strategy, underlying, option_symbol, qty, reason):
@@ -1086,12 +1093,14 @@ def close_strategy_lot(strategy, underlying, option_symbol, qty, reason):
             f"Submitted marketable LIMIT SELL strategy={strategy} contract={option_symbol} "
             f"qty={qty:g} limit=${limit_price:.2f}: {reason}"
         )
+        return True
     except (APIError, RequestException) as exc:
         bot_log(f"Strategy exit failed strategy={strategy} contract={option_symbol}: {exc}")
         record_event(
             "ORDER_FAILED", strategy=strategy, underlying=underlying,
             option_symbol=option_symbol, qty=qty, reason="exit_failed", details=str(exc)
         )
+        return False
 
 
 def manage_underlying_exits(

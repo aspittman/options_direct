@@ -287,7 +287,9 @@ def get_submitted_orders():
             continue
         if row.get("event") == "ORDER_SUBMITTED":
             submitted[order_id] = row
-        elif row.get("event") in {"ORDER_FILL", "ORDER_TERMINAL"}:
+        elif row.get("event") in {
+            "ORDER_FILL", "ORDER_TERMINAL", "ORDER_OWNERSHIP_MISMATCH"
+        }:
             filled.add(order_id)
     return {order_id: row for order_id, row in submitted.items() if order_id not in filled}
 
