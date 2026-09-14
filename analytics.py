@@ -2,6 +2,8 @@ import csv
 import re
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from collections import deque
+from zoneinfo import ZoneInfo
 
 from config import (
     ANALYTICS_FILE,
@@ -191,6 +193,53 @@ def cooldown_active(strategy, underlying, trading_days, today=None):
         if cursor.weekday() < 5:
             elapsed += 1
     return elapsed < trading_days
+
+
+def latest_underlying_loss_dates(events=None):
+    """Conservative FIFO loss detection across all strategies in this bot ledger.
+
+    Each losing matched slice starts a shared block, including partial exits.
+    This is an entry guard, not a tax-lot/wash-sale accounting calculation.
+    """
+    inventory = {}
+    losses = {}
+    for row in read_events() if events is None else events:
+        key = (row.get("strategy", ""), row.get("underlying", ""),
+               row.get("option_symbol", ""))
+        if row.get("event") == "POSITION_MISSING":
+            inventory.pop(key, None)
+            continue
+        if row.get("event") not in {"ORDER_FILL", "ORDER_PARTIAL_FILL"}:
+            continue
+        qty, price = float(row.get("qty") or 0), float(row.get("price") or 0)
+        if qty <= 0:
+            continue
+        lots = inventory.setdefault(key, deque())
+        if row.get("order_side") == "buy":
+            lots.append([qty, price])
+        elif row.get("order_side") == "sell":
+            stamp = datetime.fromisoformat(row["timestamp"].replace("Z", "+00:00"))
+            day = (stamp.astimezone(ZoneInfo("America/New_York")).date()
+                   if stamp.tzinfo else stamp.date())
+            while qty > 0 and lots:
+                matched = min(qty, lots[0][0])
+                if price < lots[0][1] and key[1]:
+                    losses[key[1]] = max(losses.get(key[1], day), day)
+                qty -= matched
+                lots[0][0] -= matched
+                if lots[0][0] <= 0:
+                    lots.popleft()
+    return losses
+
+
+def loss_reentry_block_active(underlying, today=None, loss_dates=None):
+    from config import LOSS_REENTRY_BLOCK_DAYS
+    today = today or datetime.now(ZoneInfo("America/New_York")).date()
+    losses = latest_underlying_loss_dates() if loss_dates is None else loss_dates
+    loss_day = losses.get(underlying)
+    from portfolio_loss_guard import portfolio_blocked
+    return (loss_day is not None and 0 <= (today - loss_day).days <= LOSS_REENTRY_BLOCK_DAYS
+            or portfolio_blocked(underlying, today))
 
 
 def signal_bar_already_submitted(strategy, underlying, signal_date):
@@ -681,3 +730,35 @@ def get_latest_entry_price(underlying, option_symbol):
                     latest_price = None
 
     return latest_price
+
+
+def get_option_high_water_marks():
+    """Replay entry fills and observed premium highs for the current holding only."""
+    from math import isfinite
+    quantities, highs = {}, {}
+    for row in read_events():
+        key = (row.get("strategy", ""), row.get("option_symbol", ""))
+        if not all(key):
+            continue
+        event = row.get("event")
+        if event == "POSITION_MISSING":
+            quantities.pop(key, None)
+            highs.pop(key, None)
+            continue
+        if event in {"ORDER_FILL", "ORDER_PARTIAL_FILL", "EXPIRATION_CONFIRMED"}:
+            qty = float(row.get("qty") or 0)
+            if row.get("order_side") == "buy":
+                if quantities.get(key, 0) <= 0:
+                    highs.pop(key, None)
+                quantities[key] = quantities.get(key, 0) + qty
+            elif row.get("order_side") == "sell":
+                quantities[key] = max(0, quantities.get(key, 0) - qty)
+                if quantities[key] <= 0:
+                    highs.pop(key, None)
+        if quantities.get(key, 0) <= 0:
+            continue
+        if event in {"ORDER_FILL", "ORDER_PARTIAL_FILL", "OPTION_TRAIL_SNAPSHOT", "RISK_SNAPSHOT"}:
+            price = float(row.get("price") or 0)
+            if isfinite(price) and price > 0:
+                highs[key] = max(highs.get(key, price), price)
+    return highs

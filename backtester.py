@@ -759,6 +759,8 @@ def run_backtest(
 ):
     underlyings = list(underlyings or UNDERLYINGS)
     universe_name = universe_name or "configured"
+    print("Historical daily research only: the retired swing model is not Oasis; "
+          "these simulations do not include the live shared loss block.")
     regular_trades = []
     cheap_trades = []
     regular_counts = _research_counts()
@@ -830,7 +832,7 @@ def print_paper_results():
     print("==========================")
     print("Source: confirmed Alpaca paper fills in logs/trade_analytics.csv")
 
-    for strategy in strategy_names:
+    for strategy in dict.fromkeys([*strategy_names, *report]):
         stats = report[strategy]
         current_prices = {
             item["option_symbol"]: item["current_price"]

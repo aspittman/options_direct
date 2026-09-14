@@ -150,12 +150,14 @@ PAPER_STRATEGIES = (
         "max_holding_days": 20,
     },
     {
-        "name": "max_100",
-        "signal": "daily_swing",
-        "max_premium": MAX_100_PREMIUM_PER_TRADE,
-        "underlying_trailing_stop": UNDERLYING_TRAILING_STOP_PERCENT,
-        "underlying_take_profit": 0.06,
-        "max_holding_days": 15,
+        "name": "oasis",
+        "signal": "intraday_oasis",
+        "max_premium": MAX_OPTION_PREMIUM_PER_TRADE,
+        "underlying_trailing_stop": None,
+        "underlying_take_profit": None,
+        "max_holding_days": None,
+        "option_stop_loss": 0.20,
+        "intraday": True,
     },
 )
 ALLOW_DUPLICATE_CONTRACTS = _env_bool("ALLOW_DUPLICATE_CONTRACTS", False)
@@ -224,7 +226,10 @@ BACKTEST_STARTING_CASH = _env_float(
     "BACKTEST_STARTING_CASH", VIRTUAL_STARTING_CAPITAL
 )
 OPTION_STOP_LOSS_PERCENT = _env_float("OPTION_STOP_LOSS_PERCENT", 0.30)
-OPTION_TRAILING_STOP_PERCENT = _env_float("OPTION_TRAILING_STOP_PERCENT", 0.0)
+# Oasis-only premium trail; regular keeps its existing underlying trail.
+OPTION_TRAILING_STOP_PERCENT = _env_float("OPTION_TRAILING_STOP_PERCENT", 0.20)
+if not 0 <= OPTION_TRAILING_STOP_PERCENT < 1:
+    raise ValueError("OPTION_TRAILING_STOP_PERCENT must be at least zero and less than one")
 OPTION_TAKE_PROFIT_PERCENT = 1.00
 EXIT_DTE = _env_int("EXIT_DTE", 30)
 MAX_HOLDING_DAYS = 20
@@ -235,7 +240,20 @@ EXIT_LIMIT_TIMEOUT_MINUTES = _env_int("EXIT_LIMIT_TIMEOUT_MINUTES", 2)
 OPTION_TYPE = "call"  # start with calls only
 CONTRACT_QTY = MAX_CONTRACTS_PER_TRADE
 
-SCAN_INTERVAL_SECONDS = 300
+# Oasis uses completed five-minute candles, with risk/order checks every minute.
+SCAN_INTERVAL_SECONDS = 60
+LOSS_REENTRY_BLOCK_DAYS = 30  # calendar days, inclusive; reentry on day 31
+OASIS_BAR_MINUTES = 5
+OASIS_EMA_FAST = 9
+OASIS_EMA_SLOW = 21
+OASIS_ENTRY_CUTOFF_MINUTES = 30
+OASIS_FLATTEN_MINUTES = 15
+# Manage historical swing positions under their original rules; never open new ones.
+LEGACY_SWING_STRATEGY = {
+    "name": "max_100", "signal": "daily_swing",
+    "underlying_trailing_stop": UNDERLYING_TRAILING_STOP_PERCENT,
+    "underlying_take_profit": 0.06, "max_holding_days": 15,
+}
 
 LOG_FILE = "logs/options_bot.log"
 ANALYTICS_FILE = "logs/trade_analytics.csv"
