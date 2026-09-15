@@ -1,3 +1,4 @@
+from zoneinfo import ZoneInfo
 import unittest
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -189,7 +190,7 @@ class OasisExecutionTests(unittest.TestCase):
         clock = SimpleNamespace(timestamp=now, next_close=now + timedelta(hours=3), is_open=True)
         orders = {str(i): dict(strategy=name, underlying="ABC", order_side="buy")
                   for i, name in enumerate(("regular", "oasis"))}
-        with patch.object(options_trader, "latest_underlying_loss_dates", return_value={"ABC": now.date()}), \
+        with patch.object(options_trader, "latest_underlying_loss_dates", return_value={"ABC": now.astimezone(ZoneInfo("America/New_York")).date()}), \
              patch.object(options_trader, "get_submitted_orders", return_value=orders), \
              patch.object(options_trader, "is_own_order", return_value=True), \
              patch.object(options_trader, "trading_client") as broker, \
@@ -209,7 +210,7 @@ class RuntimeSchedulingTests(unittest.TestCase):
                          "reconcile_order_fills", "cancel_blocked_entry_orders", "refresh_oasis_data",
                          "bootstrap_legacy_positions", "reconcile_strategy_lots_with_broker",
                          "log_open_option_positions", "log_account_info", "log_analytics_summary",
-                         "manage_underlying_exits", "record_event", "bot_log"):
+                         "manage_underlying_exits", "record_event", "bot_log", "report_cycle"):
                 stack.enter_context(patch.object(main, name))
             stack.enter_context(patch.object(main, "UNDERLYINGS", ["ABC"]))
             stack.enter_context(patch.object(main, "ENABLE_NEW_ENTRIES", True))
@@ -226,6 +227,7 @@ class RuntimeSchedulingTests(unittest.TestCase):
                 main.run_bot()
             self.assertEqual(daily.call_count, 1)
             self.assertEqual(intraday.call_count, 2)
+            self.assertEqual(main.report_cycle.call_count, 2)
 
 
 if __name__ == "__main__":
